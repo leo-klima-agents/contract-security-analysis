@@ -8,11 +8,13 @@ directly from the browser. No backend, no build step, no libraries.
 The entire tool is one self-contained file: [`index.html`](./index.html)
 (vanilla HTML + CSS + JS, including a from-scratch `keccak256`).
 
-It understands all three OpenZeppelin privilege primitives:
+It understands the three OpenZeppelin privilege primitives **and Safe multisigs**:
 
 - **AccessControl** — `bytes32` roles (`DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`, …)
 - **AccessManager** — `uint64` role IDs (`ADMIN_ROLE` = 0, `PUBLIC_ROLE` = max uint64)
 - **Ownable** — single `owner`
+- **Safe** (Gnosis Safe / Safe{Wallet}) — multisig `owners`, `threshold`, enabled
+  `modules`, and `guard`
 
 ## What it does
 
@@ -29,6 +31,12 @@ It understands all three OpenZeppelin privilege primitives:
    - AccessManager: `RoleGranted` / `RoleRevoked` / `RoleAdminChanged` /
      `RoleGuardianChanged` / `RoleLabel` (the last supplies human-readable names)
    - Ownable: `OwnershipTransferred`
+   - Safe: `SafeSetup` / `AddedOwner` / `RemovedOwner` / `ChangedThreshold` /
+     `EnabledModule` / `DisabledModule` / `ChangedGuard` / `ChangedFallbackHandler`.
+     The current owner set (rendered as **m-of-n**), enabled modules and guard are
+     reconstructed from these. Initial owners come from `SafeSetup` (Safe's
+     `setupOwners` emits no per-owner event), and the single address each event
+     carries is read whether it is indexed (Safe ≥ 1.4) or in the log data.
 
    These events are decoded directly from their well-known `topic0` signatures,
    so it works even when the contract — or the implementation behind a proxy —
@@ -56,7 +64,9 @@ Open the published page (or `index.html` locally), pick a network, paste a
 contract address, and click **Analyze**.
 
 Try the bundled example: contract
-`0xF35f12c2556706b074d2dCeBF178DEB9003a358b` on **Base**.
+`0xF35f12c2556706b074d2dCeBF178DEB9003a358b` on **Base**. For a Safe multisig,
+try `0xD23CCDc650b2a5709e0Eb3C7e68B9C77c20e361b` on **Base** (the Engineers
+Multisig), which resolves to its current owners and threshold.
 
 ### Run locally
 

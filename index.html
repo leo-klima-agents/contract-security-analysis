@@ -118,7 +118,7 @@
 <div class="wrap">
   <header>
     <h1>OpenZeppelin Role Analyzer</h1>
-    <p>Inspect AccessControl roles &amp; Ownable ownership of a contract via the BlockScout API — fully client-side.</p>
+    <p>Inspect AccessControl / AccessManager roles, Ownable ownership &amp; Safe multisig config of a contract via the BlockScout API — fully client-side.</p>
   </header>
 
   <div class="card">
@@ -177,8 +177,10 @@ Klima Protocol Deployer=0x723cf925e2ceec1586cd060a9a9a60ea3ace7881</textarea>
   <footer>
     Data from <a href="https://docs.blockscout.com/" target="_blank" rel="noopener">BlockScout</a>;
     transaction &amp; address links open the chain's canonical explorer (Etherscan / BaseScan / PolygonScan / Arbiscan).
-    Role holders are reconstructed by replaying <code>RoleGranted</code>/<code>RoleRevoked</code>/<code>RoleAdminChanged</code>
-    and <code>OwnershipTransferred</code> events since deployment. Labels are best-effort.
+    Role holders, owners and Safe multisig config are reconstructed by replaying
+    <code>RoleGranted</code>/<code>RoleRevoked</code>/<code>RoleAdminChanged</code>, <code>OwnershipTransferred</code>,
+    and Safe <code>SafeSetup</code>/<code>AddedOwner</code>/<code>RemovedOwner</code>/<code>ChangedThreshold</code>
+    events since deployment. Labels are best-effort.
   </footer>
 </div>
 
@@ -212,10 +214,27 @@ const AM_SIG = {
   RoleGuardianChanged: "0x7a8059630b897b5de4c08ade69f8b90c3ead1f8596d62d10b6c4d14a0afb4ae2", // (uint64,uint64)
   RoleLabel:           "0x1256f5b5ecb89caec12db449738f2fbcd1ba5806cf38f35413f4e5c15bf6a450", // (uint64,string)
 };
+/* Safe (Gnosis Safe / Safe{Wallet}) multisig config events — verified against
+ * keccak256 and a live Safe on Base. Owners/threshold are the multisig's access
+ * model; modules & guard are privilege-relevant (a module executes without owner
+ * signatures). Per-transaction Execution events are intentionally omitted as noise.
+ * The single address each event carries is indexed (topic1) on Safe ≥1.4 and in
+ * `data` on older versions — the decoder accepts either. */
+const SAFE_SIG = {
+  SafeSetup:              "0x141df868a6331af528e38c83b7aa03edc19be66e37ae67f9285bf4f8e3c6a1a8", // (address indexed,address[],uint256,address,address)
+  AddedOwner:             "0x9465fa0c962cc76958e6373a993326400c1c94f8be2fe3a952adfa7f60b2ea26", // (address)
+  RemovedOwner:           "0xf8d49fc529812e9a7c5c50e69c20f0dccc0db8fa95c98bc58cc9a4f1c1299eaf", // (address)
+  ChangedThreshold:       "0x610f7ff2b304ae8903c3de74c60c6ab1f7d6226b3f52c5161905bb5ad4039c93", // (uint256)
+  EnabledModule:          "0xecdf3a3effea5783a3c4c2140e677577666428d44ed9d474a0b3a4c9943f8440", // (address)
+  DisabledModule:         "0xaab4fa2b463f581b2b32cb3b7e3b704b9ce37cc209b5fb4d77e593ace4054276", // (address)
+  ChangedGuard:           "0x1151116914515bc0891ff9047a6cb32cf902546f83066499bcf8ba33d2353fa2", // (address)
+  ChangedFallbackHandler: "0x5ac6c46c93c8d0e53714ba3b53db3e7c046da994313d7ed0d192028bc7c228b0", // (address)
+};
 // topic0 → { system, kind }; classic & AM RoleGranted differ, so no collisions.
 const TOPIC_MAP = {};
 for (const [kind, t] of Object.entries(CLASSIC_SIG)) TOPIC_MAP[t] = { system: "classic", kind };
 for (const [kind, t] of Object.entries(AM_SIG)) TOPIC_MAP[t] = { system: "am", kind };
+for (const [kind, t] of Object.entries(SAFE_SIG)) TOPIC_MAP[t] = { system: "safe", kind };
 const ALL_TOPICS = Object.keys(TOPIC_MAP);
 
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
@@ -442,6 +461,41 @@ function decodeAbiString(data) {
 // missing indexed slots with null, and a flaky API can return short arrays).
 const hasTopic = (topics, i) => typeof topics[i] === "string" && /^0x[0-9a-fA-F]+$/.test(topics[i]);
 
+// Safe events carry their single address either indexed (topic[1], Safe ≥1.4)
+// or ABI-encoded in `data` (older versions); accept whichever is present.
+function safeAddr(topics, data) {
+  if (hasTopic(topics, 1)) return topicToAddress(topics[1]);
+  const hex = (data || "").replace(/^0x/, "");
+  if (hex.length < 64) return null;
+  return "0x" + hex.slice(24, 64).toLowerCase();
+}
+
+// Decode SafeSetup(address indexed initiator, address[] owners, uint256 threshold,
+// address initializer, address fallbackHandler). initiator is indexed; the rest
+// are ABI-encoded in `data`. Initial owners appear ONLY here (setupOwners emits
+// no per-owner AddedOwner), so this is required to reconstruct the owner set.
+function decodeSafeSetup(topics, data) {
+  const hex = (data || "").replace(/^0x/, "");
+  const word = (i) => hex.slice(i * 64, i * 64 + 64);
+  const out = {
+    initiator: hasTopic(topics, 1) ? topicToAddress(topics[1]) : null,
+    owners: [], threshold: null, fallbackHandler: null,
+  };
+  if (hex.length < 256) return out;
+  out.threshold = parseInt(word(1), 16);                  // thresholds are small
+  out.fallbackHandler = "0x" + word(3).slice(24).toLowerCase();
+  const arrStart = parseInt(word(0), 16) * 2;             // byte offset → hex-char index
+  if (arrStart && hex.length >= arrStart + 64) {
+    const n = parseInt(hex.slice(arrStart, arrStart + 64), 16);
+    for (let i = 0; i < n; i++) {
+      const s = arrStart + 64 + i * 64;
+      if (s + 64 > hex.length) break;
+      out.owners.push("0x" + hex.slice(s + 24, s + 64).toLowerCase());
+    }
+  }
+  return out;
+}
+
 function decodeLog(log) {
   try {
     return decodeLogInner(log);
@@ -484,7 +538,7 @@ function decodeLogInner(log) {
         ev.newOwner = "0x" + data.slice(88, 128).toLowerCase();
       }
     }
-  } else { // AccessManager — roles are uint64 IDs (decimal string keys)
+  } else if (info.system === "am") { // AccessManager — roles are uint64 IDs (decimal string keys)
     if (!hasTopic(topics, 1)) return null;
     ev.role = BigInt(topics[1]).toString();
     if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
@@ -495,6 +549,20 @@ function decodeLogInner(log) {
       ev.target = BigInt(topics[2]).toString();
     } else if (ev.kind === "RoleLabel") {
       ev.label = decodeAbiString(log.data);
+    }
+  } else { // safe — Gnosis Safe / Safe{Wallet} multisig
+    if (ev.kind === "SafeSetup") {
+      const s = decodeSafeSetup(topics, log.data);
+      ev.initiator = s.initiator; ev.owners = s.owners;
+      ev.threshold = s.threshold; ev.fallbackHandler = s.fallbackHandler;
+    } else if (ev.kind === "ChangedThreshold") {
+      const hex = (log.data || "").replace(/^0x/, "");
+      if (hex.length < 64) return null;
+      ev.threshold = parseInt(hex.slice(0, 64), 16);
+    } else { // AddedOwner / RemovedOwner / EnabledModule / DisabledModule / ChangedGuard / ChangedFallbackHandler
+      const a = safeAddr(topics, log.data);
+      if (!a) return null;
+      ev.account = a;
     }
   }
   return ev;
@@ -510,6 +578,7 @@ function replay(logs) {
 
   const classic = newSystemState();
   const am = newSystemState({ guardianOf: new Map(), labels: new Map(), overrides: new Map() });
+  const safe = { seen: false, owners: new Set(), modules: new Set(), threshold: null, guard: null, fallbackHandler: null, setup: null };
   let owner = null;
   const ownerHistory = [];
 
@@ -519,7 +588,25 @@ function replay(logs) {
     if (!sys.counts.has(role)) sys.counts.set(role, { granted: 0, revoked: 0 });
   };
 
+  const applySafe = (ev) => {
+    safe.seen = true;
+    switch (ev.kind) {
+      case "SafeSetup":
+        (ev.owners || []).forEach((o) => safe.owners.add(o));
+        if (ev.threshold != null) safe.threshold = ev.threshold;
+        safe.fallbackHandler = ev.fallbackHandler; safe.setup = ev; break;
+      case "AddedOwner":              safe.owners.add(ev.account); break;
+      case "RemovedOwner":            safe.owners.delete(ev.account); break;
+      case "ChangedThreshold":        safe.threshold = ev.threshold; break;
+      case "EnabledModule":           safe.modules.add(ev.account); break;
+      case "DisabledModule":          safe.modules.delete(ev.account); break;
+      case "ChangedGuard":            safe.guard = ev.account; break;
+      case "ChangedFallbackHandler":  safe.fallbackHandler = ev.account; break;
+    }
+  };
+
   for (const ev of events) {
+    if (ev.system === "safe") { applySafe(ev); continue; }
     const sys = ev.system === "am" ? am : classic;
     if (ev.kind === "RoleGranted") {
       ensure(sys, ev.role); sys.holders.get(ev.role).add(ev.account); sys.counts.get(ev.role).granted++;
@@ -535,7 +622,7 @@ function replay(logs) {
       owner = ev.newOwner; ownerHistory.push(ev);
     }
   }
-  return { classic, am, owner, ownerHistory, eventCount: events.length, events };
+  return { classic, am, safe, owner, ownerHistory, eventCount: events.length, events };
 }
 
 /* ------------------------------------------------------------------ *
@@ -603,6 +690,36 @@ function renderAmRoles(am) {
   }).join("");
 }
 
+// Safe multisig: current owners, threshold (m-of-n), modules & guard. Modules and
+// low thresholds are flagged because they widen who can move the Safe's assets.
+function renderSafe(safe) {
+  const owners = [...safe.owners].filter((a) => a && a !== ZERO_ADDR);
+  const n = owners.length;
+  const t = safe.threshold;
+  // Flag thresholds that don't require a real majority (1-of-n, or m where 2m ≤ n).
+  const weak = t != null && n > 1 && (t <= 1 || t * 2 <= n);
+  const thrText = t != null ? `${t} of ${n}` : `unknown of ${n}`;
+  const ownersHtml = owners.length
+    ? `<ul class="holders">${owners.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
+    : `<div class="empty">No current owners found (event history may be incomplete).</div>`;
+  const modules = [...safe.modules].filter((a) => a && a !== ZERO_ADDR);
+  const modulesHtml = modules.length
+    ? `<div class="banner warn">⚠ Enabled modules can execute transactions <b>without</b> owner signatures.</div>
+       <ul class="holders">${modules.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
+    : `<div class="empty">No modules enabled.</div>`;
+  const addrOrNone = (a) => (a && a !== ZERO_ADDR) ? addrLink(a) : '<span class="meta">none</span>';
+  return `<div class="card"><h2>Safe Multisig</h2>
+    <div class="kv">
+      <div class="k">Threshold</div>
+      <div><span class="pill ${weak ? "warn" : "good"}">${esc(thrText)}</span> signature${t === 1 ? "" : "s"} required to execute</div>
+      <div class="k">Owners (${n})</div><div>${ownersHtml}</div>
+      <div class="k">Modules (${modules.length})</div><div>${modulesHtml}</div>
+      <div class="k">Guard</div><div>${addrOrNone(safe.guard)}</div>
+      <div class="k">Fallback handler</div><div>${addrOrNone(safe.fallbackHandler)}</div>
+    </div>
+  </div>`;
+}
+
 // Chronological audit log of every role-related event, each linked to its tx.
 function fmtTimestamp(ts) {
   if (!ts) return "";
@@ -632,10 +749,23 @@ function eventDescription(ev, map, am) {
       if (ev.previousOwner === ZERO_ADDR) return `Ownership initialized to ${addrLink(ev.newOwner)}`;
       if (ev.newOwner === ZERO_ADDR) return `Ownership renounced (was ${addrLink(ev.previousOwner)})`;
       return `Ownership transferred ${addrLink(ev.previousOwner)} → ${addrLink(ev.newOwner)}`;
+    // Safe multisig
+    case "SafeSetup": {
+      const nOwners = (ev.owners || []).length;
+      return `Safe initialized with ${nOwners} owner${nOwners === 1 ? "" : "s"} and threshold ${ev.threshold}${ev.initiator ? ` by ${addrLink(ev.initiator)}` : ""}`;
+    }
+    case "AddedOwner":              return `Added owner ${addrLink(ev.account)}`;
+    case "RemovedOwner":            return `Removed owner ${addrLink(ev.account)}`;
+    case "ChangedThreshold":        return `Threshold changed to <b>${esc(ev.threshold)}</b>`;
+    case "EnabledModule":           return `Enabled module ${addrLink(ev.account)}`;
+    case "DisabledModule":          return `Disabled module ${addrLink(ev.account)}`;
+    case "ChangedGuard":            return ev.account === ZERO_ADDR ? `Guard removed` : `Guard set to ${addrLink(ev.account)}`;
+    case "ChangedFallbackHandler":  return ev.account === ZERO_ADDR ? `Fallback handler removed` : `Fallback handler set to ${addrLink(ev.account)}`;
     default: return esc(ev.kind);
   }
 }
 function eventSystemName(ev) {
+  if (ev.system === "safe") return "Safe";
   if (ev.kind === "OwnershipTransferred") return "Ownable";
   return ev.system === "am" ? "AccessManager" : "AccessControl";
 }
@@ -657,12 +787,13 @@ function renderAuditLog(events, map, am) {
 
 function render(ctx) {
   const { addr, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed } = ctx;
-  const { classic, am } = state;
+  const { classic, am, safe } = state;
   const out = [];
 
   // Summary
   const name = (info && (info.name || (info.token && info.token.name))) || "—";
   const systems = [];
+  if (safe.seen) systems.push("Safe");
   if (classic.rolesSeen.size) systems.push("AccessControl");
   if (am.rolesSeen.size) systems.push("AccessManager");
   if (state.ownerHistory.length) systems.push("Ownable");
@@ -689,6 +820,11 @@ function render(ctx) {
     out.push(`<div class="banner warn">⚠ One or more event queries hit BlockScout's 1000-log limit; holder lists may be incomplete for this very high-volume contract.</div>`);
   }
 
+  // Safe multisig (owners / threshold / modules / guard)
+  if (safe.seen) {
+    out.push(renderSafe(safe));
+  }
+
   // Roles declared by the ABI (classic bytes32 constants)
   if (abiRoleNames.length) {
     out.push(`<div class="card"><h2>Roles declared in ABI</h2>
@@ -711,8 +847,8 @@ function render(ctx) {
   }
 
   // No access-control activity at all
-  if (!classic.rolesSeen.size && !am.rolesSeen.size && !state.ownerHistory.length) {
-    out.push(`<div class="card"><div class="empty">No AccessControl, AccessManager, or Ownable events found for this contract since deployment.</div></div>`);
+  if (!classic.rolesSeen.size && !am.rolesSeen.size && !state.ownerHistory.length && !safe.seen) {
+    out.push(`<div class="card"><div class="empty">No AccessControl, AccessManager, Ownable, or Safe multisig events found for this contract since deployment.</div></div>`);
   }
 
   // Ownable
