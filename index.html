@@ -134,7 +134,7 @@
       </div>
       <div>
         <label for="address">Contract address</label>
-        <input id="address" class="mono" placeholder="0x…" value="0xF35f12c2556706b074d2dCeBF178DEB9003a358b" spellcheck="false">
+        <input id="address" class="mono" placeholder="0x…" value="0xf158AE8e6DeC82353E52E92Cc90dced63a861Ff1" spellcheck="false">
       </div>
       <div style="flex:0 0 auto">
         <button id="go">Analyze</button>
@@ -142,8 +142,20 @@
     </div>
     <details style="margin-top:12px">
       <summary>Custom role names (optional)</summary>
-      <label for="customRoles">Comma- or newline-separated role names to label by <code>keccak256(name)</code>, e.g. <code>GAME_ADMIN_ROLE</code>.</label>
-      <textarea id="customRoles" placeholder="MY_CUSTOM_ROLE, ANOTHER_ROLE"></textarea>
+      <label for="customRoles">Comma- or newline-separated role names to label by <code>keccak256(name)</code>, e.g. <code>GAME_ADMIN_ROLE</code>. Append <code>=&lt;id&gt;</code> to label an AccessManager numeric role, e.g. <code>CURATOR_ROLE=1</code>; the <code>=id</code> part is optional and ignored for non-AccessManager contracts.</label>
+      <textarea id="customRoles" placeholder="MY_CUSTOM_ROLE, ANOTHER_ROLE">CARBON_SYSTEM_ADMIN=1
+CARBON_LEDGER_ADMIN=2
+CARBON_VAULT_MANAGER=3
+CARBON_LIQUIDITY_MANAGER=5
+CARBON_COUPONS_ISSUER=7
+CARBON_MATURITY_MANAGER=8
+KVCM_STAKING_MANAGER_ADMIN=9
+KVCM_LOCK_NFT_OWNER=10
+KVCM_LOCK_NFT_MANAGER=11
+REWARDS_MANAGER_STATE_UPDATER=12
+PROTOCOL_REWARDS_ESCROW_MANAGER=13
+PROTOCOL_REWARDS_MINTER=14
+BETA_UPDATER=16</textarea>
     </details>
     <div id="status"></div>
   </div>
@@ -479,7 +491,7 @@ function replay(logs) {
   events.sort((a, b) => (a.block - b.block) || (a.index - b.index));
 
   const classic = newSystemState();
-  const am = newSystemState({ guardianOf: new Map(), labels: new Map() });
+  const am = newSystemState({ guardianOf: new Map(), labels: new Map(), overrides: new Map() });
   let owner = null;
   const ownerHistory = [];
 
@@ -557,7 +569,8 @@ function renderClassicRoles(state, map) {
 
 // AccessManager (uint64) roles, labelled via RoleLabel events + ADMIN/PUBLIC.
 function amRoleLabel(am, id) {
-  return am.labels.get(id) || (id === AM_ADMIN_ROLE_ID ? "ADMIN_ROLE" : id === AM_PUBLIC_ROLE_ID ? "PUBLIC_ROLE" : null);
+  return (am.overrides && am.overrides.get(id)) || am.labels.get(id) ||
+    (id === AM_ADMIN_ROLE_ID ? "ADMIN_ROLE" : id === AM_PUBLIC_ROLE_ID ? "PUBLIC_ROLE" : null);
 }
 function renderAmRoles(am) {
   const roles = [...am.rolesSeen];
@@ -722,8 +735,18 @@ async function analyze() {
     return;
   }
 
-  const customNames = ($("customRoles").value || "")
-    .split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  // Each entry is ROLE_NAME with an optional "=<id>" suffix. The name always
+  // feeds the classic keccak256 map; the id (if present) labels an
+  // AccessManager numeric role.
+  const customNames = [];
+  const amOverrides = new Map(); // decimal-string id -> name
+  ($("customRoles").value || "").split(/[\s,]+/).forEach((tok) => {
+    if (!tok) return;
+    const m = tok.match(/^([^=]+?)(?:=(\d+))?$/);
+    if (!m) return;
+    customNames.push(m[1]);
+    if (m[2] !== undefined) amOverrides.set(m[2], m[1]);
+  });
 
   $("go").disabled = true;
   try {
@@ -758,6 +781,7 @@ async function analyze() {
 
     setStatus(`Replaying ${logs.length} event${logs.length === 1 ? "" : "s"}…`);
     const state = replay(logs);
+    state.am.overrides = amOverrides;
 
     render({ addr: lc(addr), chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed });
     const roleCount = state.classic.rolesSeen.size + state.am.rolesSeen.size;
