@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Contract Access &amp; Ownership Analyzer</title>
+<title>Contract Access Analyser</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -117,7 +117,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Contract Access &amp; Ownership Analyzer</h1>
+    <h1>Contract Access Analyser</h1>
     <p>Inspect AccessControl / AccessManager roles, Ownable ownership &amp; Safe multisig config of a contract via the BlockScout API.</p>
   </header>
 
@@ -137,7 +137,7 @@
         <input id="address" class="mono" placeholder="0x…" value="0xf158AE8e6DeC82353E52E92Cc90dced63a861Ff1" spellcheck="false">
       </div>
       <div style="flex:0 0 auto">
-        <button id="go">Analyze</button>
+        <button id="go">Analyse</button>
       </div>
     </div>
     <details style="margin-top:12px">
@@ -188,7 +188,7 @@ Klima Protocol Deployer=0x723cf925e2ceec1586cd060a9a9a60ea3ace7881</textarea>
 "use strict";
 
 /* ------------------------------------------------------------------ *
- * Chain configuration (BlockScout instances — all verified reachable) *
+ * Chain configuration (BlockScout instances – all verified reachable) *
  * ------------------------------------------------------------------ */
 const CHAINS = {
   ethereum: { name: "Ethereum", base: "https://eth.blockscout.com",      explorer: "https://etherscan.io" },
@@ -197,7 +197,7 @@ const CHAINS = {
   arbitrum: { name: "Arbitrum", base: "https://arbitrum.blockscout.com", explorer: "https://arbiscan.io" },
 };
 
-/* Event signatures (topic0) — all verified against keccak256.
+/* Event signatures (topic0) – all verified against keccak256.
  * Two distinct OpenZeppelin access-control systems are supported:
  *  - "classic": AccessControl (bytes32 roles) + Ownable
  *  - "am":      AccessManager (uint64 role IDs) */
@@ -214,12 +214,12 @@ const AM_SIG = {
   RoleGuardianChanged: "0x7a8059630b897b5de4c08ade69f8b90c3ead1f8596d62d10b6c4d14a0afb4ae2", // (uint64,uint64)
   RoleLabel:           "0x1256f5b5ecb89caec12db449738f2fbcd1ba5806cf38f35413f4e5c15bf6a450", // (uint64,string)
 };
-/* Safe (Gnosis Safe / Safe{Wallet}) multisig config events — verified against
+/* Safe (Gnosis Safe / Safe{Wallet}) multisig config events – verified against
  * keccak256 and a live Safe on Base. Owners/threshold are the multisig's access
  * model; modules & guard are privilege-relevant (a module executes without owner
  * signatures). Per-transaction Execution events are intentionally omitted as noise.
  * The single address each event carries is indexed (topic1) on Safe ≥1.4 and in
- * `data` on older versions — the decoder accepts either. */
+ * `data` on older versions – the decoder accepts either. */
 const SAFE_SIG = {
   SafeSetup:              "0x141df868a6331af528e38c83b7aa03edc19be66e37ae67f9285bf4f8e3c6a1a8", // (address indexed,address[],uint256,address,address)
   AddedOwner:             "0x9465fa0c962cc76958e6373a993326400c1c94f8be2fe3a952adfa7f60b2ea26", // (address)
@@ -242,7 +242,7 @@ const DEFAULT_ADMIN_HASH = "0x" + "0".repeat(64);
 const AM_ADMIN_ROLE_ID = "0";                          // AccessManager ADMIN_ROLE
 const AM_PUBLIC_ROLE_ID = (2n ** 64n - 1n).toString(); // AccessManager PUBLIC_ROLE (max uint64)
 
-/* Common OZ role names — labelled via keccak256(name). */
+/* Common OZ role names – labelled via keccak256(name). */
 const COMMON_ROLES = [
   "MINTER_ROLE", "BURNER_ROLE", "PAUSER_ROLE", "UPGRADER_ROLE", "ADMIN_ROLE",
   "OPERATOR_ROLE", "GOVERNOR_ROLE", "MANAGER_ROLE", "EXECUTOR_ROLE", "PROPOSER_ROLE",
@@ -365,7 +365,7 @@ async function fetchJSON(url) {
 /* ------------------------------------------------------------------ *
  * BlockScout fetchers                                                 *
  * ------------------------------------------------------------------ */
-// Metadata & ABI are best-effort enrichment — any failure degrades to null
+// Metadata & ABI are best-effort enrichment – any failure degrades to null
 // rather than aborting the analysis (some BlockScout instances 5xx intermittently).
 async function fetchAddressInfo(addr) {
   try { return await fetchJSON(`${BASE}/api/v2/addresses/${addr}`); }
@@ -416,7 +416,7 @@ async function fetchRoleLogs(addr) {
  * ABI / role-name resolution                                          *
  * ------------------------------------------------------------------ */
 // bytes32 view getters that match the role-constant shape but aren't access-control
-// roles — EIP-712 artifacts (domain separator, type hashes) and similar.
+// roles – EIP-712 artifacts (domain separator, type hashes) and similar.
 const isNonRoleBytes32 = (n) =>
   n === "domainSeparator" || n === "DOMAIN_SEPARATOR" || /TYPEHASH$/i.test(n);
 
@@ -477,7 +477,7 @@ function safeAddr(topics, data) {
 }
 
 // Decode SafeSetup(address indexed initiator, address[] owners, uint256 threshold,
-// address initializer, address fallbackHandler). initiator is indexed; the rest
+// address initialiser, address fallbackHandler). initiator is indexed; the rest
 // are ABI-encoded in `data`. Initial owners appear ONLY here (setupOwners emits
 // no per-owner AddedOwner), so this is required to reconstruct the owner set.
 function decodeSafeSetup(topics, data) {
@@ -539,12 +539,12 @@ function decodeLogInner(log) {
         ev.newOwner = topicToAddress(topics[2]);
       } else {
         const data = (log.data || "").replace(/^0x/, "");
-        if (data.length < 128) return null; // not decodable — skip
+        if (data.length < 128) return null; // not decodable – skip
         ev.previousOwner = "0x" + data.slice(24, 64).toLowerCase();
         ev.newOwner = "0x" + data.slice(88, 128).toLowerCase();
       }
     }
-  } else if (info.system === "am") { // AccessManager — roles are uint64 IDs (decimal string keys)
+  } else if (info.system === "am") { // AccessManager – roles are uint64 IDs (decimal string keys)
     if (!hasTopic(topics, 1)) return null;
     ev.role = BigInt(topics[1]).toString();
     if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
@@ -556,7 +556,7 @@ function decodeLogInner(log) {
     } else if (ev.kind === "RoleLabel") {
       ev.label = decodeAbiString(log.data);
     }
-  } else { // safe — Gnosis Safe / Safe{Wallet} multisig
+  } else { // safe – Gnosis Safe / Safe{Wallet} multisig
     if (ev.kind === "SafeSetup") {
       const s = decodeSafeSetup(topics, log.data);
       ev.initiator = s.initiator; ev.owners = s.owners;
@@ -736,7 +736,7 @@ function roleDisplay(ev, map, am) {
   return labelFor(map, ev.role) || (ev.role.slice(0, 10) + "…");
 }
 function eventDescription(ev, map, am) {
-  // Lazily resolved — Ownable events carry no role, so never look one up for them.
+  // Lazily resolved – Ownable events carry no role, so never look one up for them.
   const r = () => `<b>${esc(roleDisplay(ev, map, am))}</b>`;
   switch (ev.kind) {
     case "RoleGranted":  return `Granted ${r()} to ${addrLink(ev.account)}`;
@@ -752,13 +752,13 @@ function eventDescription(ev, map, am) {
     case "RoleLabel":
       return `Labeled ${r()} as “${esc(ev.label)}”`;
     case "OwnershipTransferred":
-      if (ev.previousOwner === ZERO_ADDR) return `Ownership initialized to ${addrLink(ev.newOwner)}`;
+      if (ev.previousOwner === ZERO_ADDR) return `Ownership initialised to ${addrLink(ev.newOwner)}`;
       if (ev.newOwner === ZERO_ADDR) return `Ownership renounced (was ${addrLink(ev.previousOwner)})`;
       return `Ownership transferred ${addrLink(ev.previousOwner)} → ${addrLink(ev.newOwner)}`;
     // Safe multisig
     case "SafeSetup": {
       const nOwners = (ev.owners || []).length;
-      return `Safe initialized with ${nOwners} owner${nOwners === 1 ? "" : "s"} and threshold ${ev.threshold}${ev.initiator ? ` by ${addrLink(ev.initiator)}` : ""}`;
+      return `Safe initialised with ${nOwners} owner${nOwners === 1 ? "" : "s"} and threshold ${ev.threshold}${ev.initiator ? ` by ${addrLink(ev.initiator)}` : ""}`;
     }
     case "AddedOwner":              return `Added owner ${addrLink(ev.account)}`;
     case "RemovedOwner":            return `Removed owner ${addrLink(ev.account)}`;
@@ -798,9 +798,9 @@ function render(ctx) {
 
   // Summary. "Name" prefers the contract's on-chain/BlockScout name, then a
   // user-supplied known-account label; "Address" always shows the full address
-  // (no known-account label substitution — that belongs in the Name row).
+  // (no known-account label substitution – that belongs in the Name row).
   const knownLabel = ACCOUNT_LABELS.get(addr.toLowerCase()) || null;
-  const name = (info && (info.name || (info.token && info.token.name))) || knownLabel || "—";
+  const name = (info && (info.name || (info.token && info.token.name))) || knownLabel || "–";
   const systems = [];
   if (safe.seen) systems.push("Safe");
   if (classic.rolesSeen.size) systems.push("AccessControl");
@@ -823,7 +823,7 @@ function render(ctx) {
   </div>`);
 
   if (failed) {
-    out.push(`<div class="banner bad">⚠ One or more event queries failed after retries (the BlockScout instance may be rate-limiting or unstable). Results below may be incomplete — try again shortly.</div>`);
+    out.push(`<div class="banner bad">⚠ One or more event queries failed after retries (the BlockScout instance may be rate-limiting or unstable). Results below may be incomplete – try again shortly.</div>`);
   }
   if (truncated) {
     out.push(`<div class="banner warn">⚠ One or more event queries hit BlockScout's 1000-log limit; holder lists may be incomplete for this very high-volume contract.</div>`);
@@ -885,7 +885,7 @@ function render(ctx) {
 /* ------------------------------------------------------------------ *
  * Orchestration                                                       *
  * ------------------------------------------------------------------ */
-async function analyze() {
+async function analyse() {
   const chainKey = $("chain").value;
   const chain = CHAINS[chainKey];
   BASE = chain.base;
@@ -958,16 +958,16 @@ async function analyze() {
 
     render({ addr: lc(addr), addrDisplay: addr, chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed });
     const roleCount = state.classic.rolesSeen.size + state.am.rolesSeen.size;
-    setStatus(`Done — ${roleCount} role${roleCount === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
+    setStatus(`Done – ${roleCount} role${roleCount === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
   } catch (e) {
-    $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable — try again shortly.</div>`;
+    $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable – try again shortly.</div>`;
     setStatus("");
   } finally {
     $("go").disabled = false;
   }
 }
 
-$("go").addEventListener("click", analyze);
+$("go").addEventListener("click", analyse);
 $("address").addEventListener("keydown", (e) => { if (e.key === "Enter") analyze(); });
 </script>
 </body>
