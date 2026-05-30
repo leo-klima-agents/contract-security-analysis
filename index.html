@@ -154,17 +154,33 @@ const CHAINS = {
   arbitrum: { name: "Arbitrum", base: "https://arbitrum.blockscout.com" },
 };
 
-/* OpenZeppelin event signatures (topic0) — verified against keccak256. */
-const SIG = {
+/* Event signatures (topic0) — all verified against keccak256.
+ * Two distinct OpenZeppelin access-control systems are supported:
+ *  - "classic": AccessControl (bytes32 roles) + Ownable
+ *  - "am":      AccessManager (uint64 role IDs) */
+const CLASSIC_SIG = {
   RoleGranted:          "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d",
   RoleRevoked:          "0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b",
   RoleAdminChanged:     "0xbd79b86ffe0ab8e8776151514217cd7cacd52c909f66475c3af44e129f0b00ff",
   OwnershipTransferred: "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0",
 };
-const SIG_BY_TOPIC = Object.fromEntries(Object.entries(SIG).map(([k, v]) => [v, k]));
+const AM_SIG = {
+  RoleGranted:         "0xf98448b987f1428e0e230e1f3c6e2ce15b5693eaf31827fbd0b1ec4b424ae7cf", // (uint64,address,uint32,uint48,bool)
+  RoleRevoked:         "0xf229baa593af28c41b1d16b748cd7688f0c83aaf92d4be41c44005defe84c166", // (uint64,address)
+  RoleAdminChanged:    "0x1fd6dd7631312dfac2205b52913f99de03b4d7e381d5d27d3dbfe0713e6e6340", // (uint64,uint64)
+  RoleGuardianChanged: "0x7a8059630b897b5de4c08ade69f8b90c3ead1f8596d62d10b6c4d14a0afb4ae2", // (uint64,uint64)
+  RoleLabel:           "0x1256f5b5ecb89caec12db449738f2fbcd1ba5806cf38f35413f4e5c15bf6a450", // (uint64,string)
+};
+// topic0 → { system, kind }; classic & AM RoleGranted differ, so no collisions.
+const TOPIC_MAP = {};
+for (const [kind, t] of Object.entries(CLASSIC_SIG)) TOPIC_MAP[t] = { system: "classic", kind };
+for (const [kind, t] of Object.entries(AM_SIG)) TOPIC_MAP[t] = { system: "am", kind };
+const ALL_TOPICS = Object.keys(TOPIC_MAP);
 
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 const DEFAULT_ADMIN_HASH = "0x" + "0".repeat(64);
+const AM_ADMIN_ROLE_ID = "0";                          // AccessManager ADMIN_ROLE
+const AM_PUBLIC_ROLE_ID = (2n ** 64n - 1n).toString(); // AccessManager PUBLIC_ROLE (max uint64)
 
 /* Common OZ role names — labelled via keccak256(name). */
 const COMMON_ROLES = [
@@ -256,6 +272,7 @@ const keccak256 = (function () {
  * Helpers                                                             *
  * ------------------------------------------------------------------ */
 const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const isAddress = (s) => /^0x[0-9a-fA-F]{40}$/.test(s);
 const lc = (s) => s.toLowerCase();
@@ -281,35 +298,51 @@ async function fetchJSON(url) {
 /* ------------------------------------------------------------------ *
  * BlockScout fetchers                                                 *
  * ------------------------------------------------------------------ */
-// Address-level metadata works even for unverified contracts.
+// Metadata & ABI are best-effort enrichment — any failure degrades to null
+// rather than aborting the analysis (some BlockScout instances 5xx intermittently).
 async function fetchAddressInfo(addr) {
   try { return await fetchJSON(`${BASE}/api/v2/addresses/${addr}`); }
-  catch (e) { if (e.status === 404) return null; throw e; }
+  catch (_) { return null; }
 }
 
-// Smart-contract ABI for one address (null if not verified / not found).
+// Smart-contract ABI for one address (null if unverified / not found / error).
 async function fetchAbi(addr) {
   try {
     const data = await fetchJSON(`${BASE}/api/v2/smart-contracts/${addr}`);
     return { abi: Array.isArray(data.abi) ? data.abi : [], twin: data.verified_twin_address_hash || null };
-  } catch (e) { if (e.status === 404) return null; throw e; }
+  } catch (_) { return null; }
 }
 
-// Fetch role-related logs via the RPC getLogs endpoint (server-side topic filter).
+// Fetch one topic's logs via the RPC getLogs endpoint with retry/backoff.
+// Distinguishes a genuine empty result ("No logs found") from a transient error,
+// since some instances intermittently return {status:"0", result:null}.
+async function fetchLogsForTopic(addr, topic0) {
+  const url = `${BASE}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${addr}&topic0=${topic0}`;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { accept: "application/json" } });
+      if (res.ok) {
+        const j = await res.json();
+        if (Array.isArray(j.result)) return { items: j.result, truncated: j.result.length >= 1000, failed: false };
+        if (/no logs? found/i.test(j.message || "")) return { items: [], truncated: false, failed: false };
+      }
+    } catch (_) { /* network error → retry */ }
+    if (attempt < 3) await sleep(400 * (attempt + 1));
+  }
+  return { items: [], truncated: false, failed: true };
+}
+
+// Fetch all role-related logs (classic + AccessManager) in parallel.
 async function fetchRoleLogs(addr) {
-  const all = [];
-  let truncated = false;
-  const topics = Object.keys(SIG_BY_TOPIC);
-  const responses = await Promise.all(topics.map((topic0) =>
-    fetchJSON(`${BASE}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${addr}&topic0=${topic0}`)
-      .catch((e) => ({ status: "0", message: String(e), result: [] }))
-  ));
-  responses.forEach((resp) => {
-    const items = Array.isArray(resp.result) ? resp.result : [];
-    if (items.length >= 1000) truncated = true;
-    for (const it of items) all.push(it);
-  });
-  return { logs: all, truncated };
+  const logs = [];
+  let truncated = false, failed = false;
+  const results = await Promise.all(ALL_TOPICS.map((t0) => fetchLogsForTopic(addr, t0)));
+  for (const r of results) {
+    if (r.failed) { failed = true; continue; }
+    if (r.truncated) truncated = true;
+    for (const it of r.items) logs.push(it);
+  }
+  return { logs, truncated, failed };
 }
 
 /* ------------------------------------------------------------------ *
@@ -345,67 +378,96 @@ function buildRoleNameMap(abiRoleNames, customNames) {
 /* ------------------------------------------------------------------ *
  * Decode + replay                                                     *
  * ------------------------------------------------------------------ */
+// Decode a single ABI-encoded string from event data (used by AM RoleLabel).
+function decodeAbiString(data) {
+  const hex = (data || "").replace(/^0x/, "");
+  if (hex.length < 128) return "";
+  const len = parseInt(hex.slice(64, 128), 16);
+  const bytes = [];
+  for (let i = 0; i < len && 128 + i * 2 + 2 <= hex.length; i++) {
+    bytes.push(parseInt(hex.substr(128 + i * 2, 2), 16));
+  }
+  try { return new TextDecoder().decode(new Uint8Array(bytes)); } catch (_) { return ""; }
+}
+
 function decodeLog(log) {
   const topics = log.topics || [];
-  const kind = SIG_BY_TOPIC[topics[0]];
-  if (!kind) return null;
+  const info = TOPIC_MAP[topics[0]];
+  if (!info) return null;
   const ev = {
-    kind,
+    system: info.system,
+    kind: info.kind,
     block: parseInt(log.blockNumber, 16),
     index: parseInt(log.logIndex, 16),
     tx: log.transactionHash,
-    ts: log.timeStamp ? parseInt(log.timeStamp, 16) : null,
   };
-  if (kind === "RoleGranted" || kind === "RoleRevoked") {
-    ev.role = lc(topics[1]);
-    ev.account = topicToAddress(topics[2]);
-  } else if (kind === "RoleAdminChanged") {
-    ev.role = lc(topics[1]);
-    ev.newAdminRole = lc(topics[3]);
-  } else if (kind === "OwnershipTransferred") {
-    // OZ indexes both params; fall back to data if a contract emitted them unindexed.
-    if (topics.length >= 3) {
-      ev.previousOwner = topicToAddress(topics[1]);
-      ev.newOwner = topicToAddress(topics[2]);
-    } else {
-      const data = (log.data || "").replace(/^0x/, "");
-      ev.previousOwner = "0x" + data.slice(24, 64).toLowerCase();
-      ev.newOwner = "0x" + data.slice(88, 128).toLowerCase();
+  if (info.system === "classic") {
+    if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
+      ev.role = lc(topics[1]);
+      ev.account = topicToAddress(topics[2]);
+    } else if (ev.kind === "RoleAdminChanged") {
+      ev.role = lc(topics[1]);
+      ev.newAdminRole = lc(topics[3]);
+    } else if (ev.kind === "OwnershipTransferred") {
+      // OZ indexes both params; fall back to data if a contract emitted them unindexed.
+      if (topics.length >= 3 && topics[2]) {
+        ev.previousOwner = topicToAddress(topics[1]);
+        ev.newOwner = topicToAddress(topics[2]);
+      } else {
+        const data = (log.data || "").replace(/^0x/, "");
+        ev.previousOwner = "0x" + data.slice(24, 64).toLowerCase();
+        ev.newOwner = "0x" + data.slice(88, 128).toLowerCase();
+      }
+    }
+  } else { // AccessManager — roles are uint64 IDs (decimal string keys)
+    ev.role = BigInt(topics[1]).toString();
+    if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
+      ev.account = topicToAddress(topics[2]);
+    } else if (ev.kind === "RoleAdminChanged" || ev.kind === "RoleGuardianChanged") {
+      ev.target = BigInt(topics[2]).toString();
+    } else if (ev.kind === "RoleLabel") {
+      ev.label = decodeAbiString(log.data);
     }
   }
   return ev;
+}
+
+function newSystemState(extra) {
+  return Object.assign({ holders: new Map(), adminOf: new Map(), counts: new Map(), rolesSeen: new Set() }, extra || {});
 }
 
 function replay(logs) {
   const events = logs.map(decodeLog).filter(Boolean);
   events.sort((a, b) => (a.block - b.block) || (a.index - b.index));
 
-  const holders = new Map();    // role → Set(account)
-  const adminOf = new Map();    // role → adminRole
-  const counts = new Map();     // role → {granted, revoked}
-  const rolesSeen = new Set();
+  const classic = newSystemState();
+  const am = newSystemState({ guardianOf: new Map(), labels: new Map() });
   let owner = null;
   const ownerHistory = [];
 
-  const ensure = (role) => {
-    rolesSeen.add(role);
-    if (!holders.has(role)) holders.set(role, new Set());
-    if (!counts.has(role)) counts.set(role, { granted: 0, revoked: 0 });
+  const ensure = (sys, role) => {
+    sys.rolesSeen.add(role);
+    if (!sys.holders.has(role)) sys.holders.set(role, new Set());
+    if (!sys.counts.has(role)) sys.counts.set(role, { granted: 0, revoked: 0 });
   };
 
   for (const ev of events) {
+    const sys = ev.system === "am" ? am : classic;
     if (ev.kind === "RoleGranted") {
-      ensure(ev.role); holders.get(ev.role).add(ev.account); counts.get(ev.role).granted++;
+      ensure(sys, ev.role); sys.holders.get(ev.role).add(ev.account); sys.counts.get(ev.role).granted++;
     } else if (ev.kind === "RoleRevoked") {
-      ensure(ev.role); holders.get(ev.role).delete(ev.account); counts.get(ev.role).revoked++;
+      ensure(sys, ev.role); sys.holders.get(ev.role).delete(ev.account); sys.counts.get(ev.role).revoked++;
     } else if (ev.kind === "RoleAdminChanged") {
-      ensure(ev.role); adminOf.set(ev.role, ev.newAdminRole);
+      ensure(sys, ev.role); sys.adminOf.set(ev.role, ev.system === "am" ? ev.target : ev.newAdminRole);
+    } else if (ev.kind === "RoleGuardianChanged") {
+      ensure(sys, ev.role); sys.guardianOf.set(ev.role, ev.target);
+    } else if (ev.kind === "RoleLabel") {
+      ensure(sys, ev.role); sys.labels.set(ev.role, ev.label);
     } else if (ev.kind === "OwnershipTransferred") {
-      owner = ev.newOwner;
-      ownerHistory.push(ev);
+      owner = ev.newOwner; ownerHistory.push(ev);
     }
   }
-  return { holders, adminOf, counts, rolesSeen, owner, ownerHistory, eventCount: events.length };
+  return { classic, am, owner, ownerHistory, eventCount: events.length };
 }
 
 /* ------------------------------------------------------------------ *
@@ -415,17 +477,14 @@ function labelFor(map, hash) {
   return map[lc(hash)] || null;
 }
 
-function renderRole(map, role, holderSet, adminOf, counts) {
-  const label = labelFor(map, role);
-  const adminRole = adminOf.get(role) || DEFAULT_ADMIN_HASH;
-  const adminLabel = labelFor(map, adminRole);
-  const c = counts.get(role) || { granted: 0, revoked: 0 };
+// Generic role card. `label`/`adminText` are pre-resolved display strings;
+// `idText` is the raw identifier (bytes32 hash or uint64 id) shown verbatim.
+function renderRoleCard(label, idText, adminText, counts, holderSet, extraMeta) {
+  const c = counts || { granted: 0, revoked: 0 };
   const accounts = [...holderSet];
-
   const holdersHtml = accounts.length
     ? `<ul class="holders">${accounts.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
     : `<div class="empty">No current holders (all granted roles were revoked).</div>`;
-
   return `<div class="role">
     <div class="role-head">
       <h3>${label ? esc(label) : '<span class="meta">Unknown role</span>'}
@@ -433,25 +492,68 @@ function renderRole(map, role, holderSet, adminOf, counts) {
       </h3>
       <span class="meta">${c.granted} granted · ${c.revoked} revoked</span>
     </div>
-    <div class="role-hash">${esc(role)}</div>
-    <div class="meta" style="margin-top:4px">admin role: ${adminLabel ? esc(adminLabel) : "<span class='mono'>" + esc(adminRole.slice(0, 14)) + "…</span>"}</div>
+    <div class="role-hash">${esc(idText)}</div>
+    <div class="meta" style="margin-top:4px">admin role: ${adminText}${extraMeta ? " · " + extraMeta : ""}</div>
     ${holdersHtml}
   </div>`;
 }
 
+// Classic AccessControl (bytes32) roles, labelled via the keccak256 dictionary.
+function renderClassicRoles(state, map) {
+  const roles = [...state.rolesSeen];
+  roles.sort((a, b) => {
+    if (a === DEFAULT_ADMIN_HASH) return -1;
+    if (b === DEFAULT_ADMIN_HASH) return 1;
+    const la = labelFor(map, a), lb = labelFor(map, b);
+    if (la && !lb) return -1;
+    if (lb && !la) return 1;
+    return (la || a).localeCompare(lb || b);
+  });
+  return roles.map((r) => {
+    const adminRole = state.adminOf.get(r) || DEFAULT_ADMIN_HASH;
+    const adminLabel = labelFor(map, adminRole);
+    const adminText = adminLabel ? esc(adminLabel) : `<span class="mono">${esc(adminRole.slice(0, 14))}…</span>`;
+    return renderRoleCard(labelFor(map, r), r, adminText, state.counts.get(r), state.holders.get(r));
+  }).join("");
+}
+
+// AccessManager (uint64) roles, labelled via RoleLabel events + ADMIN/PUBLIC.
+function amRoleLabel(am, id) {
+  return am.labels.get(id) || (id === AM_ADMIN_ROLE_ID ? "ADMIN_ROLE" : id === AM_PUBLIC_ROLE_ID ? "PUBLIC_ROLE" : null);
+}
+function renderAmRoles(am) {
+  const roles = [...am.rolesSeen];
+  roles.sort((a, b) => BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0);
+  return roles.map((id) => {
+    const label = amRoleLabel(am, id);
+    const adminId = am.adminOf.get(id) || AM_ADMIN_ROLE_ID;
+    const adminText = `${esc(amRoleLabel(am, adminId) || ("role " + adminId))} <span class="meta">(id ${esc(adminId)})</span>`;
+    const guardianId = am.guardianOf.get(id);
+    const extra = guardianId ? `guardian: ${esc(amRoleLabel(am, guardianId) || ("role " + guardianId))}` : "";
+    return renderRoleCard(label, `role id ${id}`, adminText, am.counts.get(id), am.holders.get(id), extra);
+  }).join("");
+}
+
 function render(ctx) {
-  const { addr, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated } = ctx;
+  const { addr, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed } = ctx;
+  const { classic, am } = state;
   const out = [];
 
   // Summary
   const name = (info && (info.name || (info.token && info.token.name))) || "—";
-  const verified = abiAvailable;
+  const systems = [];
+  if (classic.rolesSeen.size) systems.push("AccessControl");
+  if (am.rolesSeen.size) systems.push("AccessManager");
+  if (state.ownerHistory.length) systems.push("Ownable");
   out.push(`<div class="card"><h2>Contract</h2>
     <div class="kv">
       <div class="k">Network</div><div>${esc(chainName)}</div>
       <div class="k">Address</div><div class="mono">${addrLink(addr)}</div>
       <div class="k">Name</div><div>${esc(name)}</div>
-      <div class="k">ABI</div><div>${verified
+      <div class="k">Access control</div><div>${systems.length
+        ? systems.map((s) => `<span class="pill info">${s}</span>`).join(" ")
+        : '<span class="pill warn">none detected</span>'}</div>
+      <div class="k">ABI</div><div>${abiAvailable
         ? '<span class="pill good">verified</span>'
         : '<span class="pill warn">unverified / unavailable</span> <span class="meta">role labels fall back to keccak256 dictionary</span>'}</div>
       ${isProxy ? `<div class="k">Proxy</div><div><span class="pill info">proxy</span> implementation: <span class="mono">${implAddr ? addrLink(implAddr) : "unknown"}</span></div>` : ""}
@@ -459,11 +561,14 @@ function render(ctx) {
     </div>
   </div>`);
 
+  if (failed) {
+    out.push(`<div class="banner bad">⚠ One or more event queries failed after retries (the BlockScout instance may be rate-limiting or unstable). Results below may be incomplete — try again shortly.</div>`);
+  }
   if (truncated) {
     out.push(`<div class="banner warn">⚠ One or more event queries hit BlockScout's 1000-log limit; holder lists may be incomplete for this very high-volume contract.</div>`);
   }
 
-  // Roles declared by the ABI
+  // Roles declared by the ABI (classic bytes32 constants)
   if (abiRoleNames.length) {
     out.push(`<div class="card"><h2>Roles declared in ABI</h2>
       <div class="meta" style="margin-bottom:8px">bytes32 constants exposed by the contract interface.</div>
@@ -474,25 +579,20 @@ function render(ctx) {
     </div>`);
   }
 
-  // Live role holders (from events)
-  const roles = [...state.rolesSeen];
-  // sort: known labels first, DEFAULT_ADMIN first of all
-  roles.sort((a, b) => {
-    if (a === DEFAULT_ADMIN_HASH) return -1;
-    if (b === DEFAULT_ADMIN_HASH) return 1;
-    const la = labelFor(map, a), lb = labelFor(map, b);
-    if (la && !lb) return -1;
-    if (lb && !la) return 1;
-    return (la || a).localeCompare(lb || b);
-  });
-
-  out.push(`<div class="card"><h2>Current role holders <span class="meta">(replayed from ${state.eventCount} event${state.eventCount === 1 ? "" : "s"})</span></h2>`);
-  if (roles.length) {
-    out.push(roles.map((r) => renderRole(map, r, state.holders.get(r), state.adminOf, state.counts)).join(""));
-  } else {
-    out.push(`<div class="empty">No AccessControl role events (RoleGranted / RoleRevoked / RoleAdminChanged) found for this contract.</div>`);
+  // Classic AccessControl holders
+  if (classic.rolesSeen.size) {
+    out.push(`<div class="card"><h2>AccessControl role holders</h2>${renderClassicRoles(classic, map)}</div>`);
   }
-  out.push(`</div>`);
+
+  // AccessManager holders
+  if (am.rolesSeen.size) {
+    out.push(`<div class="card"><h2>AccessManager roles <span class="meta">(uint64 role IDs)</span></h2>${renderAmRoles(am)}</div>`);
+  }
+
+  // No access-control activity at all
+  if (!classic.rolesSeen.size && !am.rolesSeen.size && !state.ownerHistory.length) {
+    out.push(`<div class="card"><div class="empty">No AccessControl, AccessManager, or Ownable events found for this contract since deployment.</div></div>`);
+  }
 
   // Ownable
   if (state.ownerHistory.length) {
@@ -560,13 +660,14 @@ async function analyze() {
     const map = buildRoleNameMap(abiRoleNames, customNames);
 
     setStatus("Scanning role events since deployment…");
-    const { logs, truncated } = await fetchRoleLogs(addr);
+    const { logs, truncated, failed } = await fetchRoleLogs(addr);
 
     setStatus(`Replaying ${logs.length} event${logs.length === 1 ? "" : "s"}…`);
     const state = replay(logs);
 
-    render({ addr: lc(addr), chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated });
-    setStatus(`Done — ${state.rolesSeen.size} role${state.rolesSeen.size === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
+    render({ addr: lc(addr), chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed });
+    const roleCount = state.classic.rolesSeen.size + state.am.rolesSeen.size;
+    setStatus(`Done — ${roleCount} role${roleCount === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
   } catch (e) {
     $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable — try again shortly.</div>`;
     setStatus("");
