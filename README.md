@@ -8,6 +8,12 @@ directly from the browser. No backend, no build step, no libraries.
 The entire tool is one self-contained file: [`index.html`](./index.html)
 (vanilla HTML + CSS + JS, including a from-scratch `keccak256`).
 
+It understands all three OpenZeppelin privilege primitives:
+
+- **AccessControl** — `bytes32` roles (`DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`, …)
+- **AccessManager** — `uint64` role IDs (`ADMIN_ROLE` = 0, `PUBLIC_ROLE` = max uint64)
+- **Ownable** — single `owner`
+
 ## What it does
 
 1. **Roles declared by the contract (from the ABI, if available).**
@@ -17,15 +23,25 @@ The entire tool is one self-contained file: [`index.html`](./index.html)
    (`DEFAULT_ADMIN_ROLE`, `*_ROLE`, …).
 
 2. **Current account → role assignments (from events).**
-   It reconstructs who currently holds each role by replaying every
-   `RoleGranted` / `RoleRevoked` / `RoleAdminChanged` event since deployment
-   (and Ownable `OwnershipTransferred`). These events are decoded directly from
-   their well-known `topic0` signatures, so it works even when the contract —
-   or the implementation behind a proxy — is **not verified**.
+   It reconstructs who currently holds each role by replaying the relevant
+   events since deployment:
+   - AccessControl: `RoleGranted` / `RoleRevoked` / `RoleAdminChanged`
+   - AccessManager: `RoleGranted` / `RoleRevoked` / `RoleAdminChanged` /
+     `RoleGuardianChanged` / `RoleLabel` (the last supplies human-readable names)
+   - Ownable: `OwnershipTransferred`
 
-Role hashes are labelled best-effort by matching against `keccak256(name)` for a
-built-in dictionary of common OpenZeppelin role names, any names found in the
-ABI, and any custom names you supply. Unmatched hashes are shown verbatim.
+   These events are decoded directly from their well-known `topic0` signatures,
+   so it works even when the contract — or the implementation behind a proxy —
+   is **not verified**.
+
+AccessControl role hashes are labelled best-effort by matching against
+`keccak256(name)` for a built-in dictionary of common OpenZeppelin role names,
+any names found in the ABI, and any custom names you supply. AccessManager roles
+are labelled from on-chain `RoleLabel` events (plus the well-known ADMIN/PUBLIC
+roles). Unmatched roles are shown by their raw `bytes32` hash or `uint64` ID.
+
+Queries to BlockScout are retried with backoff, and transient failures are
+surfaced as a warning so an incomplete result is never mistaken for an empty one.
 
 ## Usage
 
