@@ -1,14 +1,14 @@
 # OpenZeppelin Role Analyzer
 
-A single-page, **fully client-side** tool that inspects the OpenZeppelin
-access-control state of a smart contract on **Ethereum, Base, Polygon, or
+A single-page, **fully client-side** tool that inspects the access-control and
+ownership state of a smart contract on **Ethereum, Base, Polygon, or
 Arbitrum**, using the public [BlockScout](https://docs.blockscout.com/) API
 directly from the browser. No backend, no build step, no libraries.
 
 The entire tool is one self-contained file: [`index.html`](./index.html)
 (vanilla HTML + CSS + JS, including a from-scratch `keccak256`).
 
-It understands the three OpenZeppelin privilege primitives **and Safe multisigs**:
+It understands four common privilege primitives:
 
 - **AccessControl** — `bytes32` roles (`DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`, …)
 - **AccessManager** — `uint64` role IDs (`ADMIN_ROLE` = 0, `PUBLIC_ROLE` = max uint64)
