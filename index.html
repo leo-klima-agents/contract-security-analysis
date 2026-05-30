@@ -157,6 +157,18 @@ PROTOCOL_REWARDS_ESCROW_MANAGER=13
 PROTOCOL_REWARDS_MINTER=14
 BETA_UPDATER=16</textarea>
     </details>
+    <details style="margin-top:12px">
+      <summary>Known accounts (optional)</summary>
+      <label for="knownAccounts">One <code>Label=0xAddress</code> per line. Matching addresses are shown by name everywhere they appear (role holders, owner, audit log).</label>
+      <textarea id="knownAccounts" placeholder="My Multisig=0x…">Engineers Multisig=0xD23CCDc650b2a5709e0Eb3C7e68B9C77c20e361b
+Klima Protocol Carbon Ledger=0xAD87E90614276430b25801Dfc0C76E01e309d6E1
+Klima Protocol Asset Manager=0x1C24239309398220883207681602BfF4D10fbde1
+Klima Protocol Staking Manager=0x5101a7ca3E8815C0FeeD8976F109EE01D8ED0c3D
+Klima Protocol Reward Manager=0xada87d6f68054d0caB4789b332279b18932e928F
+Klima Protocol Minter=0xDF92D10E5A59BF0af8BAC192EB3Fd380857d3572
+Klima Protocol Treasury=0x75295d12c90d59bd038d7cb7102c466f8017fa25
+Klima Protocol Deployer=0x723cf925e2ceec1586cd060a9a9a60ea3ace7881</textarea>
+    </details>
     <div id="status"></div>
   </div>
 
@@ -310,7 +322,13 @@ const roleHashForName = (name) => (name === "DEFAULT_ADMIN_ROLE" ? DEFAULT_ADMIN
 
 let BASE = "";     // active BlockScout API base URL (data source)
 let EXPLORER = ""; // active canonical block explorer base URL (Etherscan / BaseScan / …)
-const addrLink = (a) => `<a href="${EXPLORER}/address/${a}" target="_blank" rel="noopener">${esc(a)}</a>`;
+let ACCOUNT_LABELS = new Map(); // lowercased address -> human-readable label
+const addrLink = (a) => {
+  const link = `<a href="${EXPLORER}/address/${a}" target="_blank" rel="noopener">`;
+  const label = a && ACCOUNT_LABELS.get(a.toLowerCase());
+  if (label) return `${link}${esc(label)}</a> <span class="meta mono">${esc(a.slice(0, 6) + "…" + a.slice(-4))}</span>`;
+  return `${link}${esc(a)}</a>`;
+};
 const txLink = (h, label) => `<a href="${EXPLORER}/tx/${h}" target="_blank" rel="noopener">${esc(label || h.slice(0, 10) + "…")}</a>`;
 
 function setStatus(msg) { $("status").textContent = msg; }
@@ -746,6 +764,16 @@ async function analyze() {
     if (!m) return;
     customNames.push(m[1]);
     if (m[2] !== undefined) amOverrides.set(m[2], m[1]);
+  });
+
+  // Known accounts: one "Label=0xAddress" per line (labels may contain spaces).
+  ACCOUNT_LABELS = new Map();
+  ($("knownAccounts").value || "").split(/\r?\n/).forEach((line) => {
+    const i = line.lastIndexOf("=");
+    if (i < 0) return;
+    const label = line.slice(0, i).trim();
+    const addr = line.slice(i + 1).trim();
+    if (label && isAddress(addr)) ACCOUNT_LABELS.set(addr.toLowerCase(), label);
   });
 
   $("go").disabled = true;
