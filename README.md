@@ -1,4 +1,4 @@
-# OpenZeppelin Role Analyzer
+# Contract Access & Ownership Analyzer
 
 A single-page, **fully client-side** tool that inspects the access-control and
 ownership state of a smart contract on **Ethereum, Base, Polygon, or
