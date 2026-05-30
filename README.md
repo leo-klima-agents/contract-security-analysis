@@ -1,26 +1,27 @@
-# Contract Access & Ownership Analyzer
+# Contract Access Analyser
 
 A single-page, **fully client-side** tool that inspects the access-control and
-ownership state of a smart contract on **Ethereum, Base, Polygon, or
-Arbitrum**, using the public [BlockScout](https://docs.blockscout.com/) API
-directly from the browser. No backend, no build step, no libraries.
+ownership state of a smart contract on **Ethereum, Base, Polygon, or Arbitrum**,
+using the public [BlockScout](https://docs.blockscout.com/) API directly from
+the browser. No backend, no build step, no libraries.
 
 The entire tool is one self-contained file: [`index.html`](./index.html)
 (vanilla HTML + CSS + JS, including a from-scratch `keccak256`).
 
 It understands four common privilege primitives:
 
-- **AccessControl** — `bytes32` roles (`DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`, …)
-- **AccessManager** — `uint64` role IDs (`ADMIN_ROLE` = 0, `PUBLIC_ROLE` = max uint64)
-- **Ownable** — single `owner`
-- **Safe** (Gnosis Safe / Safe{Wallet}) — multisig `owners`, `threshold`, enabled
-  `modules`, and `guard`
+- **AccessControl** – `bytes32` roles (`DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`, …)
+- **AccessManager** – `uint64` role IDs (`ADMIN_ROLE` = 0,
+  `PUBLIC_ROLE` = max uint64)
+- **Ownable** – single `owner`
+- **Safe** (Gnosis Safe / Safe{Wallet}) – multisig `owners`, `threshold`,
+  enabled `modules`, and `guard`
 
 ## What it does
 
 1. **Roles declared by the contract (from the ABI, if available).**
-   It fetches the verified ABI via BlockScout. For EIP-1967 / proxy contracts
-   it resolves and pulls the **implementation** ABI (or its verified bytecode
+   It fetches the verified ABI via BlockScout. For EIP-1967 / proxy contracts it
+   resolves and pulls the **implementation** ABI (or its verified bytecode
    twin), then lists the `bytes32` role constants the interface exposes
    (`DEFAULT_ADMIN_ROLE`, `*_ROLE`, …).
 
@@ -29,25 +30,27 @@ It understands four common privilege primitives:
    events since deployment:
    - AccessControl: `RoleGranted` / `RoleRevoked` / `RoleAdminChanged`
    - AccessManager: `RoleGranted` / `RoleRevoked` / `RoleAdminChanged` /
-     `RoleGuardianChanged` / `RoleLabel` (the last supplies human-readable names)
+     `RoleGuardianChanged` / `RoleLabel` (the last supplies human-readable
+     names)
    - Ownable: `OwnershipTransferred`
    - Safe: `SafeSetup` / `AddedOwner` / `RemovedOwner` / `ChangedThreshold` /
-     `EnabledModule` / `DisabledModule` / `ChangedGuard` / `ChangedFallbackHandler`.
-     The current owner set (rendered as **m-of-n**), enabled modules and guard are
-     reconstructed from these. Initial owners come from `SafeSetup` (Safe's
-     `setupOwners` emits no per-owner event), and the single address each event
-     carries is read whether it is indexed (Safe ≥ 1.4) or in the log data.
+     `EnabledModule` / `DisabledModule` / `ChangedGuard` /
+     `ChangedFallbackHandler`. The current owner set (rendered as **m-of-n**),
+     enabled modules and guard are reconstructed from these. Initial owners come
+     from `SafeSetup` (Safe's `setupOwners` emits no per-owner event), and the
+     single address each event carries is read whether it is indexed
+     (Safe ≥ 1.4) or in the log data.
 
    These events are decoded directly from their well-known `topic0` signatures,
-   so it works even when the contract — or the implementation behind a proxy —
+   so it works even when the contract – or the implementation behind a proxy –
    is **not verified**.
 
 3. **Audit log.**
-   A chronological (oldest → newest) list of every role-update event —
-   grants, revocations, admin/guardian changes, labels and ownership transfers —
-   with the block, timestamp, a human-readable description, and a link to the
-   transaction on the chain's canonical explorer (Etherscan / BaseScan /
-   PolygonScan / Arbiscan).
+   A chronological (oldest → newest) list of every role-update event (grants,
+   revocations, admin/guardian changes, labels and ownership transfers) with the
+   block, timestamp, a human-readable description, and a link to the transaction
+   on the chain's canonical explorer (Etherscan / BaseScan / PolygonScan /
+   Arbiscan).
 
 AccessControl role hashes are labelled best-effort by matching against
 `keccak256(name)` for a built-in dictionary of common OpenZeppelin role names,
@@ -56,12 +59,13 @@ are labelled from on-chain `RoleLabel` events (plus the well-known ADMIN/PUBLIC
 roles). Unmatched roles are shown by their raw `bytes32` hash or `uint64` ID.
 
 Queries to BlockScout are retried with backoff, and transient failures are
-surfaced as a warning so an incomplete result is never mistaken for an empty one.
+surfaced as a warning so an incomplete result is never mistaken for an empty
+one.
 
 ## Usage
 
-Open the published page (or `index.html` locally), pick a network, paste a
-contract address, and click **Analyze**.
+Open the file `index.html`, pick a network, paste a contract address, and click
+**Analyse**.
 
 Try the bundled example: contract
 `0xF35f12c2556706b074d2dCeBF178DEB9003a358b` on **Base**. For a Safe multisig,
@@ -75,7 +79,7 @@ python3 -m http.server 8000
 # then open http://localhost:8000
 ```
 
-(Opening the file directly via `file://` also works — all calls are CORS-enabled
+(Opening the file directly via `file://` also works: all calls are CORS-enabled
 BlockScout endpoints.)
 
 ## Deployment
