@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenZeppelin Role Analyzer</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  header h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  header p { color: var(--muted); margin: 0 0 24px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1; min-width: 180px; }
+  input, select, textarea, button {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    width: 100%;
+  }
+  input.mono { font-family: var(--mono); }
+  textarea { resize: vertical; min-height: 38px; font-family: var(--mono); font-size: 0.85rem; }
+  button {
+    background: var(--accent);
+    color: #0d1117;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    width: auto;
+    padding: 9px 20px;
+    white-space: nowrap;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: 0.55; cursor: default; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+  details[open] summary { margin-bottom: 8px; }
+  #status { min-height: 22px; color: var(--muted); font-size: 0.9rem; margin: 4px 2px 0; }
+  .hidden { display: none; }
+  h2 { font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin: 0 0 12px; }
+  h3 { font-size: 0.95rem; margin: 0; }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 4px 12px; font-size: 0.9rem; }
+  .kv .k { color: var(--muted); }
+  .mono { font-family: var(--mono); word-break: break-all; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .pill {
+    display: inline-block; font-size: 0.72rem; font-weight: 600;
+    padding: 1px 8px; border-radius: 999px; vertical-align: middle;
+  }
+  .pill.good { background: rgba(63,185,80,.15); color: var(--good); }
+  .pill.warn { background: rgba(210,153,34,.15); color: var(--warn); }
+  .pill.bad  { background: rgba(248,81,73,.15);  color: var(--bad); }
+  .pill.info { background: rgba(88,166,255,.15); color: var(--accent); }
+  .role {
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel-2); padding: 12px; margin-bottom: 10px;
+  }
+  .role-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .role-hash { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
+  .holders { list-style: none; padding: 0; margin: 8px 0 0; }
+  .holders li { font-family: var(--mono); font-size: 0.85rem; padding: 2px 0; }
+  .empty { color: var(--muted); font-style: italic; font-size: 0.85rem; margin-top: 6px; }
+  .banner { border-radius: 6px; padding: 8px 12px; font-size: 0.88rem; margin-bottom: 12px; }
+  .banner.warn { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.4); color: #e3b341; }
+  .banner.bad  { background: rgba(248,81,73,.12);  border: 1px solid rgba(248,81,73,.4);  color: #ff7b72; }
+  .meta { color: var(--muted); font-size: 0.8rem; }
+  footer { color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }
+  code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>OpenZeppelin Role Analyzer</h1>
+    <p>Inspect AccessControl roles &amp; Ownable ownership of a contract via the BlockScout API — fully client-side.</p>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:0 0 160px">
+        <label for="chain">Network</label>
+        <select id="chain">
+          <option value="ethereum">Ethereum</option>
+          <option value="base" selected>Base</option>
+          <option value="polygon">Polygon</option>
+          <option value="arbitrum">Arbitrum</option>
+        </select>
+      </div>
+      <div>
+        <label for="address">Contract address</label>
+        <input id="address" class="mono" placeholder="0x…" value="0xF35f12c2556706b074d2dCeBF178DEB9003a358b" spellcheck="false">
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="go">Analyze</button>
+      </div>
+    </div>
+    <details style="margin-top:12px">
+      <summary>Custom role names (optional)</summary>
+      <label for="customRoles">Comma- or newline-separated role names to label by <code>keccak256(name)</code>, e.g. <code>GAME_ADMIN_ROLE</code>.</label>
+      <textarea id="customRoles" placeholder="MY_CUSTOM_ROLE, ANOTHER_ROLE"></textarea>
+    </details>
+    <div id="status"></div>
+  </div>
+
+  <div id="results"></div>
+
+  <footer>
+    Data from <a href="https://docs.blockscout.com/" target="_blank" rel="noopener">BlockScout</a>.
+    Role holders are reconstructed by replaying <code>RoleGranted</code>/<code>RoleRevoked</code>/<code>RoleAdminChanged</code>
+    and <code>OwnershipTransferred</code> events since deployment. Labels are best-effort.
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Chain configuration (BlockScout instances — all verified reachable) *
+ * ------------------------------------------------------------------ */
+const CHAINS = {
+  ethereum: { name: "Ethereum", base: "https://eth.blockscout.com" },
+  base:     { name: "Base",     base: "https://base.blockscout.com" },
+  polygon:  { name: "Polygon",  base: "https://polygon.blockscout.com" },
+  arbitrum: { name: "Arbitrum", base: "https://arbitrum.blockscout.com" },
+};
+
+/* OpenZeppelin event signatures (topic0) — verified against keccak256. */
+const SIG = {
+  RoleGranted:          "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d",
+  RoleRevoked:          "0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b",
+  RoleAdminChanged:     "0xbd79b86ffe0ab8e8776151514217cd7cacd52c909f66475c3af44e129f0b00ff",
+  OwnershipTransferred: "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0",
+};
+const SIG_BY_TOPIC = Object.fromEntries(Object.entries(SIG).map(([k, v]) => [v, k]));
+
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+const DEFAULT_ADMIN_HASH = "0x" + "0".repeat(64);
+
+/* Common OZ role names — labelled via keccak256(name). */
+const COMMON_ROLES = [
+  "MINTER_ROLE", "BURNER_ROLE", "PAUSER_ROLE", "UPGRADER_ROLE", "ADMIN_ROLE",
+  "OPERATOR_ROLE", "GOVERNOR_ROLE", "MANAGER_ROLE", "EXECUTOR_ROLE", "PROPOSER_ROLE",
+  "CANCELLER_ROLE", "TIMELOCK_ADMIN_ROLE", "RELAYER_ROLE", "SNAPSHOT_ROLE",
+  "DISTRIBUTOR_ROLE", "TREASURY_ROLE", "BLACKLISTER_ROLE", "RESCUER_ROLE",
+  "WHITELISTER_ROLE", "ORACLE_ROLE", "KEEPER_ROLE", "GUARDIAN_ROLE",
+  "DEPOSITOR_ROLE", "WITHDRAWER_ROLE", "SIGNER_ROLE", "VALIDATOR_ROLE",
+  "CONTROLLER_ROLE", "FACTORY_ROLE", "BRIDGE_ROLE", "FEE_MANAGER_ROLE",
+];
+
+/* ------------------------------------------------------------------ *
+ * Keccak-256 (loop-based keccak-f[1600]; single sponge block).        *
+ * Verified against standard test vectors. No external dependencies.   *
+ * ------------------------------------------------------------------ */
+const keccak256 = (function () {
+  const RHO = [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14];
+  const RC = [
+    [0x00000000, 0x00000001], [0x00000000, 0x00008082], [0x80000000, 0x0000808a], [0x80000000, 0x80008000],
+    [0x00000000, 0x0000808b], [0x00000000, 0x80000001], [0x80000000, 0x80008081], [0x80000000, 0x00008009],
+    [0x00000000, 0x0000008a], [0x00000000, 0x00000088], [0x00000000, 0x80008009], [0x00000000, 0x8000000a],
+    [0x00000000, 0x8000808b], [0x80000000, 0x0000008b], [0x80000000, 0x00008089], [0x80000000, 0x00008003],
+    [0x80000000, 0x00008002], [0x80000000, 0x00000080], [0x00000000, 0x0000800a], [0x80000000, 0x8000000a],
+    [0x80000000, 0x80008081], [0x80000000, 0x00008080], [0x00000000, 0x80000001], [0x80000000, 0x80008008],
+  ];
+  function rotl(hi, lo, n) {
+    if (n === 0) return [hi, lo];
+    if (n < 32) return [(hi << n) | (lo >>> (32 - n)), (lo << n) | (hi >>> (32 - n))];
+    if (n === 32) return [lo, hi];
+    n -= 32;
+    return [(lo << n) | (hi >>> (32 - n)), (hi << n) | (lo >>> (32 - n))];
+  }
+  function f(hi, lo) {
+    const Ch = new Array(5), Cl = new Array(5), Bh = new Array(25), Bl = new Array(25);
+    for (let round = 0; round < 24; round++) {
+      for (let x = 0; x < 5; x++) {
+        Ch[x] = hi[x] ^ hi[x + 5] ^ hi[x + 10] ^ hi[x + 15] ^ hi[x + 20];
+        Cl[x] = lo[x] ^ lo[x + 5] ^ lo[x + 10] ^ lo[x + 15] ^ lo[x + 20];
+      }
+      for (let x = 0; x < 5; x++) {
+        const r = rotl(Ch[(x + 1) % 5], Cl[(x + 1) % 5], 1);
+        const dh = Ch[(x + 4) % 5] ^ r[0], dl = Cl[(x + 4) % 5] ^ r[1];
+        for (let y = 0; y < 25; y += 5) { hi[x + y] ^= dh; lo[x + y] ^= dl; }
+      }
+      for (let x = 0; x < 5; x++) {
+        for (let y = 0; y < 5; y++) {
+          const idx = x + 5 * y, dest = y + 5 * ((2 * x + 3 * y) % 5);
+          const r = rotl(hi[idx], lo[idx], RHO[idx]);
+          Bh[dest] = r[0]; Bl[dest] = r[1];
+        }
+      }
+      for (let y = 0; y < 25; y += 5) {
+        for (let x = 0; x < 5; x++) {
+          hi[x + y] = Bh[x + y] ^ ((~Bh[(x + 1) % 5 + y]) & Bh[(x + 2) % 5 + y]);
+          lo[x + y] = Bl[x + y] ^ ((~Bl[(x + 1) % 5 + y]) & Bl[(x + 2) % 5 + y]);
+        }
+      }
+      hi[0] ^= RC[round][0]; lo[0] ^= RC[round][1];
+    }
+  }
+  return function keccak256(str) {
+    const bytes = new TextEncoder().encode(str);
+    const RATE = 136;
+    if (bytes.length >= RATE) throw new Error("input too long for single-block keccak256");
+    const hi = new Array(25).fill(0), lo = new Array(25).fill(0);
+    const padded = new Uint8Array(RATE);
+    padded.set(bytes);
+    padded[bytes.length] ^= 0x01;
+    padded[RATE - 1] ^= 0x80;
+    for (let p = 0; p < RATE; p++) {
+      const lane = p >> 3, bil = p & 7, v = padded[p];
+      if (bil < 4) lo[lane] ^= v << (bil * 8);
+      else hi[lane] ^= v << ((bil - 4) * 8);
+    }
+    f(hi, lo);
+    let out = "";
+    for (let p = 0; p < 32; p++) {
+      const lane = p >> 3, bil = p & 7;
+      const word = bil < 4 ? lo[lane] : hi[lane];
+      const byte = (word >>> ((bil < 4 ? bil : bil - 4) * 8)) & 0xff;
+      out += byte.toString(16).padStart(2, "0");
+    }
+    return "0x" + out;
+  };
+})();
+
+/* ------------------------------------------------------------------ *
+ * Helpers                                                             *
+ * ------------------------------------------------------------------ */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const isAddress = (s) => /^0x[0-9a-fA-F]{40}$/.test(s);
+const lc = (s) => s.toLowerCase();
+const topicToAddress = (t) => "0x" + t.slice(-40).toLowerCase();
+const roleHashForName = (name) => (name === "DEFAULT_ADMIN_ROLE" ? DEFAULT_ADMIN_HASH : keccak256(name));
+
+let BASE = ""; // active explorer base URL
+const addrLink = (a) => `<a href="${BASE}/address/${a}" target="_blank" rel="noopener">${esc(a)}</a>`;
+const txLink = (h) => `<a href="${BASE}/tx/${h}" target="_blank" rel="noopener">${esc(h.slice(0, 10))}…</a>`;
+
+function setStatus(msg) { $("status").textContent = msg; }
+
+async function fetchJSON(url) {
+  const res = await fetch(url, { headers: { accept: "application/json" } });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+/* ------------------------------------------------------------------ *
+ * BlockScout fetchers                                                 *
+ * ------------------------------------------------------------------ */
+// Address-level metadata works even for unverified contracts.
+async function fetchAddressInfo(addr) {
+  try { return await fetchJSON(`${BASE}/api/v2/addresses/${addr}`); }
+  catch (e) { if (e.status === 404) return null; throw e; }
+}
+
+// Smart-contract ABI for one address (null if not verified / not found).
+async function fetchAbi(addr) {
+  try {
+    const data = await fetchJSON(`${BASE}/api/v2/smart-contracts/${addr}`);
+    return { abi: Array.isArray(data.abi) ? data.abi : [], twin: data.verified_twin_address_hash || null };
+  } catch (e) { if (e.status === 404) return null; throw e; }
+}
+
+// Fetch role-related logs via the RPC getLogs endpoint (server-side topic filter).
+async function fetchRoleLogs(addr) {
+  const all = [];
+  let truncated = false;
+  const topics = Object.keys(SIG_BY_TOPIC);
+  const responses = await Promise.all(topics.map((topic0) =>
+    fetchJSON(`${BASE}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${addr}&topic0=${topic0}`)
+      .catch((e) => ({ status: "0", message: String(e), result: [] }))
+  ));
+  responses.forEach((resp) => {
+    const items = Array.isArray(resp.result) ? resp.result : [];
+    if (items.length >= 1000) truncated = true;
+    for (const it of items) all.push(it);
+  });
+  return { logs: all, truncated };
+}
+
+/* ------------------------------------------------------------------ *
+ * ABI / role-name resolution                                          *
+ * ------------------------------------------------------------------ */
+// No-input view functions returning a single bytes32 → declared role constants.
+function extractRoleNames(abi) {
+  const names = [];
+  for (const item of abi || []) {
+    if (item.type === "function" &&
+        (!item.inputs || item.inputs.length === 0) &&
+        Array.isArray(item.outputs) && item.outputs.length === 1 &&
+        item.outputs[0].type === "bytes32" &&
+        (item.stateMutability === "view" || item.stateMutability === "pure" || item.constant)) {
+      names.push(item.name);
+    }
+  }
+  return names;
+}
+
+function buildRoleNameMap(abiRoleNames, customNames) {
+  const map = {}; // hash(lowercase) → name
+  const add = (name) => {
+    try { map[lc(roleHashForName(name))] = name; } catch (_) { /* skip too-long names */ }
+  };
+  add("DEFAULT_ADMIN_ROLE");
+  COMMON_ROLES.forEach(add);
+  (abiRoleNames || []).forEach(add);     // ABI-declared names win over common guesses
+  (customNames || []).forEach(add);      // user-supplied names win over everything
+  return map;
+}
+
+/* ------------------------------------------------------------------ *
+ * Decode + replay                                                     *
+ * ------------------------------------------------------------------ */
+function decodeLog(log) {
+  const topics = log.topics || [];
+  const kind = SIG_BY_TOPIC[topics[0]];
+  if (!kind) return null;
+  const ev = {
+    kind,
+    block: parseInt(log.blockNumber, 16),
+    index: parseInt(log.logIndex, 16),
+    tx: log.transactionHash,
+    ts: log.timeStamp ? parseInt(log.timeStamp, 16) : null,
+  };
+  if (kind === "RoleGranted" || kind === "RoleRevoked") {
+    ev.role = lc(topics[1]);
+    ev.account = topicToAddress(topics[2]);
+  } else if (kind === "RoleAdminChanged") {
+    ev.role = lc(topics[1]);
+    ev.newAdminRole = lc(topics[3]);
+  } else if (kind === "OwnershipTransferred") {
+    // OZ indexes both params; fall back to data if a contract emitted them unindexed.
+    if (topics.length >= 3) {
+      ev.previousOwner = topicToAddress(topics[1]);
+      ev.newOwner = topicToAddress(topics[2]);
+    } else {
+      const data = (log.data || "").replace(/^0x/, "");
+      ev.previousOwner = "0x" + data.slice(24, 64).toLowerCase();
+      ev.newOwner = "0x" + data.slice(88, 128).toLowerCase();
+    }
+  }
+  return ev;
+}
+
+function replay(logs) {
+  const events = logs.map(decodeLog).filter(Boolean);
+  events.sort((a, b) => (a.block - b.block) || (a.index - b.index));
+
+  const holders = new Map();    // role → Set(account)
+  const adminOf = new Map();    // role → adminRole
+  const counts = new Map();     // role → {granted, revoked}
+  const rolesSeen = new Set();
+  let owner = null;
+  const ownerHistory = [];
+
+  const ensure = (role) => {
+    rolesSeen.add(role);
+    if (!holders.has(role)) holders.set(role, new Set());
+    if (!counts.has(role)) counts.set(role, { granted: 0, revoked: 0 });
+  };
+
+  for (const ev of events) {
+    if (ev.kind === "RoleGranted") {
+      ensure(ev.role); holders.get(ev.role).add(ev.account); counts.get(ev.role).granted++;
+    } else if (ev.kind === "RoleRevoked") {
+      ensure(ev.role); holders.get(ev.role).delete(ev.account); counts.get(ev.role).revoked++;
+    } else if (ev.kind === "RoleAdminChanged") {
+      ensure(ev.role); adminOf.set(ev.role, ev.newAdminRole);
+    } else if (ev.kind === "OwnershipTransferred") {
+      owner = ev.newOwner;
+      ownerHistory.push(ev);
+    }
+  }
+  return { holders, adminOf, counts, rolesSeen, owner, ownerHistory, eventCount: events.length };
+}
+
+/* ------------------------------------------------------------------ *
+ * Rendering                                                           *
+ * ------------------------------------------------------------------ */
+function labelFor(map, hash) {
+  return map[lc(hash)] || null;
+}
+
+function renderRole(map, role, holderSet, adminOf, counts) {
+  const label = labelFor(map, role);
+  const adminRole = adminOf.get(role) || DEFAULT_ADMIN_HASH;
+  const adminLabel = labelFor(map, adminRole);
+  const c = counts.get(role) || { granted: 0, revoked: 0 };
+  const accounts = [...holderSet];
+
+  const holdersHtml = accounts.length
+    ? `<ul class="holders">${accounts.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
+    : `<div class="empty">No current holders (all granted roles were revoked).</div>`;
+
+  return `<div class="role">
+    <div class="role-head">
+      <h3>${label ? esc(label) : '<span class="meta">Unknown role</span>'}
+        <span class="pill ${accounts.length ? "info" : "warn"}">${accounts.length} holder${accounts.length === 1 ? "" : "s"}</span>
+      </h3>
+      <span class="meta">${c.granted} granted · ${c.revoked} revoked</span>
+    </div>
+    <div class="role-hash">${esc(role)}</div>
+    <div class="meta" style="margin-top:4px">admin role: ${adminLabel ? esc(adminLabel) : "<span class='mono'>" + esc(adminRole.slice(0, 14)) + "…</span>"}</div>
+    ${holdersHtml}
+  </div>`;
+}
+
+function render(ctx) {
+  const { addr, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated } = ctx;
+  const out = [];
+
+  // Summary
+  const name = (info && (info.name || (info.token && info.token.name))) || "—";
+  const verified = abiAvailable;
+  out.push(`<div class="card"><h2>Contract</h2>
+    <div class="kv">
+      <div class="k">Network</div><div>${esc(chainName)}</div>
+      <div class="k">Address</div><div class="mono">${addrLink(addr)}</div>
+      <div class="k">Name</div><div>${esc(name)}</div>
+      <div class="k">ABI</div><div>${verified
+        ? '<span class="pill good">verified</span>'
+        : '<span class="pill warn">unverified / unavailable</span> <span class="meta">role labels fall back to keccak256 dictionary</span>'}</div>
+      ${isProxy ? `<div class="k">Proxy</div><div><span class="pill info">proxy</span> implementation: <span class="mono">${implAddr ? addrLink(implAddr) : "unknown"}</span></div>` : ""}
+      ${info && info.creation_transaction_hash ? `<div class="k">Created</div><div class="mono">${txLink(info.creation_transaction_hash)}</div>` : ""}
+    </div>
+  </div>`);
+
+  if (truncated) {
+    out.push(`<div class="banner warn">⚠ One or more event queries hit BlockScout's 1000-log limit; holder lists may be incomplete for this very high-volume contract.</div>`);
+  }
+
+  // Roles declared by the ABI
+  if (abiRoleNames.length) {
+    out.push(`<div class="card"><h2>Roles declared in ABI</h2>
+      <div class="meta" style="margin-bottom:8px">bytes32 constants exposed by the contract interface.</div>
+      ${abiRoleNames.map((n) => {
+        let h; try { h = roleHashForName(n); } catch (_) { h = "(name too long to hash)"; }
+        return `<div class="role"><div class="role-head"><h3>${esc(n)}</h3></div><div class="role-hash">${esc(h)}</div></div>`;
+      }).join("")}
+    </div>`);
+  }
+
+  // Live role holders (from events)
+  const roles = [...state.rolesSeen];
+  // sort: known labels first, DEFAULT_ADMIN first of all
+  roles.sort((a, b) => {
+    if (a === DEFAULT_ADMIN_HASH) return -1;
+    if (b === DEFAULT_ADMIN_HASH) return 1;
+    const la = labelFor(map, a), lb = labelFor(map, b);
+    if (la && !lb) return -1;
+    if (lb && !la) return 1;
+    return (la || a).localeCompare(lb || b);
+  });
+
+  out.push(`<div class="card"><h2>Current role holders <span class="meta">(replayed from ${state.eventCount} event${state.eventCount === 1 ? "" : "s"})</span></h2>`);
+  if (roles.length) {
+    out.push(roles.map((r) => renderRole(map, r, state.holders.get(r), state.adminOf, state.counts)).join(""));
+  } else {
+    out.push(`<div class="empty">No AccessControl role events (RoleGranted / RoleRevoked / RoleAdminChanged) found for this contract.</div>`);
+  }
+  out.push(`</div>`);
+
+  // Ownable
+  if (state.ownerHistory.length) {
+    out.push(`<div class="card"><h2>Ownable</h2>
+      <div class="kv">
+        <div class="k">Current owner</div>
+        <div class="mono">${state.owner && state.owner !== ZERO_ADDR ? addrLink(state.owner)
+          : '<span class="pill warn">renounced</span> <span class="meta">' + esc(ZERO_ADDR) + "</span>"}</div>
+      </div>
+      <details style="margin-top:10px"><summary>Ownership history (${state.ownerHistory.length})</summary>
+        <ul class="holders">${state.ownerHistory.map((e) =>
+          `<li>${esc(e.previousOwner)} → ${esc(e.newOwner)} <span class="meta">@ block ${e.block} · ${txLink(e.tx)}</span></li>`
+        ).join("")}</ul>
+      </details>
+    </div>`);
+  }
+
+  $("results").innerHTML = out.join("");
+}
+
+/* ------------------------------------------------------------------ *
+ * Orchestration                                                       *
+ * ------------------------------------------------------------------ */
+async function analyze() {
+  const chainKey = $("chain").value;
+  const chain = CHAINS[chainKey];
+  BASE = chain.base;
+  const addr = $("address").value.trim();
+  $("results").innerHTML = "";
+
+  if (!isAddress(addr)) {
+    $("results").innerHTML = `<div class="banner bad">Please enter a valid 0x-prefixed 40-hex-character address.</div>`;
+    return;
+  }
+
+  const customNames = ($("customRoles").value || "")
+    .split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+
+  $("go").disabled = true;
+  try {
+    setStatus("Fetching contract metadata…");
+    const info = await fetchAddressInfo(addr);
+
+    // Proxy / implementation resolution
+    const isProxy = !!(info && (info.proxy_type || (info.implementations && info.implementations.length)));
+    const implAddr = info && info.implementations && info.implementations.length
+      ? info.implementations[0].address_hash : null;
+
+    setStatus("Fetching ABI…");
+    let abi = [];
+    let abiAvailable = false;
+    const own = await fetchAbi(addr);
+    if (own) { abi = abi.concat(own.abi); if (own.abi.length) abiAvailable = true; }
+
+    // For proxies, pull the implementation ABI (or its verified twin) for role constants.
+    const implCandidates = [implAddr, own && own.twin].filter((a) => a && isAddress(a) && lc(a) !== lc(addr));
+    for (const cand of implCandidates) {
+      try {
+        const implAbi = await fetchAbi(cand);
+        if (implAbi && implAbi.abi.length) { abi = abi.concat(implAbi.abi); abiAvailable = true; break; }
+      } catch (_) { /* ignore */ }
+    }
+
+    const abiRoleNames = [...new Set(extractRoleNames(abi))];
+    const map = buildRoleNameMap(abiRoleNames, customNames);
+
+    setStatus("Scanning role events since deployment…");
+    const { logs, truncated } = await fetchRoleLogs(addr);
+
+    setStatus(`Replaying ${logs.length} event${logs.length === 1 ? "" : "s"}…`);
+    const state = replay(logs);
+
+    render({ addr: lc(addr), chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated });
+    setStatus(`Done — ${state.rolesSeen.size} role${state.rolesSeen.size === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
+  } catch (e) {
+    $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable — try again shortly.</div>`;
+    setStatus("");
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+$("go").addEventListener("click", analyze);
+$("address").addEventListener("keydown", (e) => { if (e.key === "Enter") analyze(); });
+</script>
+</body>
+</html>
