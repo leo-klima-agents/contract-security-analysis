@@ -94,6 +94,22 @@
   .banner.warn { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.4); color: #e3b341; }
   .banner.bad  { background: rgba(248,81,73,.12);  border: 1px solid rgba(248,81,73,.4);  color: #ff7b72; }
   .meta { color: var(--muted); font-size: 0.8rem; }
+  ol.log { list-style: none; counter-reset: log; padding: 0; margin: 0; }
+  .log-row {
+    counter-increment: log;
+    border-left: 2px solid var(--border);
+    padding: 8px 0 8px 14px; margin-left: 4px; position: relative;
+  }
+  .log-row + .log-row { border-top: 1px solid rgba(48,54,61,.5); }
+  .log-row::before {
+    content: counter(log); position: absolute; left: -9px; top: 10px;
+    width: 16px; height: 16px; border-radius: 50%; background: var(--panel-2);
+    border: 1px solid var(--border); color: var(--muted);
+    font-size: 0.6rem; line-height: 16px; text-align: center;
+  }
+  .log-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 0.78rem; }
+  .log-desc { margin-top: 3px; font-size: 0.9rem; }
+  .log-desc .mono, .log-meta .mono { word-break: break-all; }
   footer { color: var(--muted); font-size: 0.8rem; margin-top: 32px; text-align: center; }
   code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 </style>
@@ -135,7 +151,8 @@
   <div id="results"></div>
 
   <footer>
-    Data from <a href="https://docs.blockscout.com/" target="_blank" rel="noopener">BlockScout</a>.
+    Data from <a href="https://docs.blockscout.com/" target="_blank" rel="noopener">BlockScout</a>;
+    transaction &amp; address links open the chain's canonical explorer (Etherscan / BaseScan / PolygonScan / Arbiscan).
     Role holders are reconstructed by replaying <code>RoleGranted</code>/<code>RoleRevoked</code>/<code>RoleAdminChanged</code>
     and <code>OwnershipTransferred</code> events since deployment. Labels are best-effort.
   </footer>
@@ -148,10 +165,10 @@
  * Chain configuration (BlockScout instances — all verified reachable) *
  * ------------------------------------------------------------------ */
 const CHAINS = {
-  ethereum: { name: "Ethereum", base: "https://eth.blockscout.com" },
-  base:     { name: "Base",     base: "https://base.blockscout.com" },
-  polygon:  { name: "Polygon",  base: "https://polygon.blockscout.com" },
-  arbitrum: { name: "Arbitrum", base: "https://arbitrum.blockscout.com" },
+  ethereum: { name: "Ethereum", base: "https://eth.blockscout.com",      explorer: "https://etherscan.io" },
+  base:     { name: "Base",     base: "https://base.blockscout.com",     explorer: "https://basescan.org" },
+  polygon:  { name: "Polygon",  base: "https://polygon.blockscout.com",  explorer: "https://polygonscan.com" },
+  arbitrum: { name: "Arbitrum", base: "https://arbitrum.blockscout.com", explorer: "https://arbiscan.io" },
 };
 
 /* Event signatures (topic0) — all verified against keccak256.
@@ -279,9 +296,10 @@ const lc = (s) => s.toLowerCase();
 const topicToAddress = (t) => "0x" + t.slice(-40).toLowerCase();
 const roleHashForName = (name) => (name === "DEFAULT_ADMIN_ROLE" ? DEFAULT_ADMIN_HASH : keccak256(name));
 
-let BASE = ""; // active explorer base URL
-const addrLink = (a) => `<a href="${BASE}/address/${a}" target="_blank" rel="noopener">${esc(a)}</a>`;
-const txLink = (h) => `<a href="${BASE}/tx/${h}" target="_blank" rel="noopener">${esc(h.slice(0, 10))}…</a>`;
+let BASE = "";     // active BlockScout API base URL (data source)
+let EXPLORER = ""; // active canonical block explorer base URL (Etherscan / BaseScan / …)
+const addrLink = (a) => `<a href="${EXPLORER}/address/${a}" target="_blank" rel="noopener">${esc(a)}</a>`;
+const txLink = (h, label) => `<a href="${EXPLORER}/tx/${h}" target="_blank" rel="noopener">${esc(label || h.slice(0, 10) + "…")}</a>`;
 
 function setStatus(msg) { $("status").textContent = msg; }
 
@@ -390,8 +408,20 @@ function decodeAbiString(data) {
   try { return new TextDecoder().decode(new Uint8Array(bytes)); } catch (_) { return ""; }
 }
 
+// A topic is usable only if it's a 0x-prefixed hex string (BlockScout pads
+// missing indexed slots with null, and a flaky API can return short arrays).
+const hasTopic = (topics, i) => typeof topics[i] === "string" && /^0x[0-9a-fA-F]+$/.test(topics[i]);
+
 function decodeLog(log) {
-  const topics = log.topics || [];
+  try {
+    return decodeLogInner(log);
+  } catch (_) {
+    return null; // never let one malformed log abort the whole analysis
+  }
+}
+
+function decodeLogInner(log) {
+  const topics = (log && log.topics) || [];
   const info = TOPIC_MAP[topics[0]];
   if (!info) return null;
   const ev = {
@@ -400,8 +430,12 @@ function decodeLog(log) {
     block: parseInt(log.blockNumber, 16),
     index: parseInt(log.logIndex, 16),
     tx: log.transactionHash,
+    ts: log.timeStamp ? parseInt(log.timeStamp, 16) : null,
   };
   if (info.system === "classic") {
+    if (ev.kind !== "OwnershipTransferred" && !hasTopic(topics, 1)) return null;
+    if ((ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") && !hasTopic(topics, 2)) return null;
+    if (ev.kind === "RoleAdminChanged" && !hasTopic(topics, 3)) return null;
     if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
       ev.role = lc(topics[1]);
       ev.account = topicToAddress(topics[2]);
@@ -410,20 +444,24 @@ function decodeLog(log) {
       ev.newAdminRole = lc(topics[3]);
     } else if (ev.kind === "OwnershipTransferred") {
       // OZ indexes both params; fall back to data if a contract emitted them unindexed.
-      if (topics.length >= 3 && topics[2]) {
+      if (hasTopic(topics, 1) && hasTopic(topics, 2)) {
         ev.previousOwner = topicToAddress(topics[1]);
         ev.newOwner = topicToAddress(topics[2]);
       } else {
         const data = (log.data || "").replace(/^0x/, "");
+        if (data.length < 128) return null; // not decodable — skip
         ev.previousOwner = "0x" + data.slice(24, 64).toLowerCase();
         ev.newOwner = "0x" + data.slice(88, 128).toLowerCase();
       }
     }
   } else { // AccessManager — roles are uint64 IDs (decimal string keys)
+    if (!hasTopic(topics, 1)) return null;
     ev.role = BigInt(topics[1]).toString();
     if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
+      if (!hasTopic(topics, 2)) return null;
       ev.account = topicToAddress(topics[2]);
     } else if (ev.kind === "RoleAdminChanged" || ev.kind === "RoleGuardianChanged") {
+      if (!hasTopic(topics, 2)) return null;
       ev.target = BigInt(topics[2]).toString();
     } else if (ev.kind === "RoleLabel") {
       ev.label = decodeAbiString(log.data);
@@ -467,14 +505,14 @@ function replay(logs) {
       owner = ev.newOwner; ownerHistory.push(ev);
     }
   }
-  return { classic, am, owner, ownerHistory, eventCount: events.length };
+  return { classic, am, owner, ownerHistory, eventCount: events.length, events };
 }
 
 /* ------------------------------------------------------------------ *
  * Rendering                                                           *
  * ------------------------------------------------------------------ */
 function labelFor(map, hash) {
-  return map[lc(hash)] || null;
+  return hash ? (map[lc(hash)] || null) : null;
 }
 
 // Generic role card. `label`/`adminText` are pre-resolved display strings;
@@ -532,6 +570,58 @@ function renderAmRoles(am) {
     const extra = guardianId ? `guardian: ${esc(amRoleLabel(am, guardianId) || ("role " + guardianId))}` : "";
     return renderRoleCard(label, `role id ${id}`, adminText, am.counts.get(id), am.holders.get(id), extra);
   }).join("");
+}
+
+// Chronological audit log of every role-related event, each linked to its tx.
+function fmtTimestamp(ts) {
+  if (!ts) return "";
+  return new Date(ts * 1000).toISOString().slice(0, 19).replace("T", " ") + " UTC";
+}
+function roleDisplay(ev, map, am) {
+  if (ev.system === "am") return amRoleLabel(am, ev.role) || ("role " + ev.role);
+  return labelFor(map, ev.role) || (ev.role.slice(0, 10) + "…");
+}
+function eventDescription(ev, map, am) {
+  // Lazily resolved — Ownable events carry no role, so never look one up for them.
+  const r = () => `<b>${esc(roleDisplay(ev, map, am))}</b>`;
+  switch (ev.kind) {
+    case "RoleGranted":  return `Granted ${r()} to ${addrLink(ev.account)}`;
+    case "RoleRevoked":  return `Revoked ${r()} from ${addrLink(ev.account)}`;
+    case "RoleAdminChanged": {
+      const adm = ev.system === "am"
+        ? (amRoleLabel(am, ev.target) || ("role " + ev.target))
+        : (labelFor(map, ev.newAdminRole) || (ev.newAdminRole.slice(0, 10) + "…"));
+      return `Admin role of ${r()} changed to <b>${esc(adm)}</b>`;
+    }
+    case "RoleGuardianChanged":
+      return `Guardian of ${r()} changed to <b>${esc(amRoleLabel(am, ev.target) || ("role " + ev.target))}</b>`;
+    case "RoleLabel":
+      return `Labeled ${r()} as “${esc(ev.label)}”`;
+    case "OwnershipTransferred":
+      if (ev.previousOwner === ZERO_ADDR) return `Ownership initialized to ${addrLink(ev.newOwner)}`;
+      if (ev.newOwner === ZERO_ADDR) return `Ownership renounced (was ${addrLink(ev.previousOwner)})`;
+      return `Ownership transferred ${addrLink(ev.previousOwner)} → ${addrLink(ev.newOwner)}`;
+    default: return esc(ev.kind);
+  }
+}
+function eventSystemName(ev) {
+  if (ev.kind === "OwnershipTransferred") return "Ownable";
+  return ev.system === "am" ? "AccessManager" : "AccessControl";
+}
+function renderAuditLog(events, map, am) {
+  if (!events.length) return "";
+  const rows = events.map((ev) => `<li class="log-row">
+    <div class="log-meta">
+      <span class="pill info">${eventSystemName(ev)}</span>
+      <span class="mono">${esc(ev.kind)}</span>
+      <span class="meta">block ${ev.block}${ev.ts ? " · " + esc(fmtTimestamp(ev.ts)) : ""}</span>
+      ${txLink(ev.tx, "view tx ↗")}
+    </div>
+    <div class="log-desc">${eventDescription(ev, map, am)}</div>
+  </li>`).join("");
+  return `<div class="card"><h2>Audit log <span class="meta">(${events.length} event${events.length === 1 ? "" : "s"}, oldest → newest)</span></h2>
+    <ol class="log">${rows}</ol>
+  </div>`;
 }
 
 function render(ctx) {
@@ -610,6 +700,9 @@ function render(ctx) {
     </div>`);
   }
 
+  // Chronological audit log of all role-related events
+  out.push(renderAuditLog(state.events, map, am));
+
   $("results").innerHTML = out.join("");
 }
 
@@ -620,6 +713,7 @@ async function analyze() {
   const chainKey = $("chain").value;
   const chain = CHAINS[chainKey];
   BASE = chain.base;
+  EXPLORER = chain.explorer;
   const addr = $("address").value.trim();
   $("results").innerHTML = "";
 

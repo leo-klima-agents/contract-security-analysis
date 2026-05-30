@@ -34,6 +34,13 @@ It understands all three OpenZeppelin privilege primitives:
    so it works even when the contract — or the implementation behind a proxy —
    is **not verified**.
 
+3. **Audit log.**
+   A chronological (oldest → newest) list of every role-update event —
+   grants, revocations, admin/guardian changes, labels and ownership transfers —
+   with the block, timestamp, a human-readable description, and a link to the
+   transaction on the chain's canonical explorer (Etherscan / BaseScan /
+   PolygonScan / Arbiscan).
+
 AccessControl role hashes are labelled best-effort by matching against
 `keccak256(name)` for a built-in dictionary of common OpenZeppelin role names,
 any names found in the ABI, and any custom names you supply. AccessManager roles
