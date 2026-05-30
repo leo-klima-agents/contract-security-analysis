@@ -415,6 +415,11 @@ async function fetchRoleLogs(addr) {
 /* ------------------------------------------------------------------ *
  * ABI / role-name resolution                                          *
  * ------------------------------------------------------------------ */
+// bytes32 view getters that match the role-constant shape but aren't access-control
+// roles — EIP-712 artifacts (domain separator, type hashes) and similar.
+const isNonRoleBytes32 = (n) =>
+  n === "domainSeparator" || n === "DOMAIN_SEPARATOR" || /TYPEHASH$/i.test(n);
+
 // No-input view functions returning a single bytes32 → declared role constants.
 function extractRoleNames(abi) {
   const names = [];
@@ -423,7 +428,8 @@ function extractRoleNames(abi) {
         (!item.inputs || item.inputs.length === 0) &&
         Array.isArray(item.outputs) && item.outputs.length === 1 &&
         item.outputs[0].type === "bytes32" &&
-        (item.stateMutability === "view" || item.stateMutability === "pure" || item.constant)) {
+        (item.stateMutability === "view" || item.stateMutability === "pure" || item.constant) &&
+        !isNonRoleBytes32(item.name)) {
       names.push(item.name);
     }
   }
@@ -786,12 +792,15 @@ function renderAuditLog(events, map, am) {
 }
 
 function render(ctx) {
-  const { addr, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed } = ctx;
+  const { addr, addrDisplay, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed } = ctx;
   const { classic, am, safe } = state;
   const out = [];
 
-  // Summary
-  const name = (info && (info.name || (info.token && info.token.name))) || "—";
+  // Summary. "Name" prefers the contract's on-chain/BlockScout name, then a
+  // user-supplied known-account label; "Address" always shows the full address
+  // (no known-account label substitution — that belongs in the Name row).
+  const knownLabel = ACCOUNT_LABELS.get(addr.toLowerCase()) || null;
+  const name = (info && (info.name || (info.token && info.token.name))) || knownLabel || "—";
   const systems = [];
   if (safe.seen) systems.push("Safe");
   if (classic.rolesSeen.size) systems.push("AccessControl");
@@ -800,7 +809,7 @@ function render(ctx) {
   out.push(`<div class="card"><h2>Contract</h2>
     <div class="kv">
       <div class="k">Network</div><div>${esc(chainName)}</div>
-      <div class="k">Address</div><div class="mono">${addrLink(addr)}</div>
+      <div class="k">Address</div><div class="mono"><a href="${EXPLORER}/address/${addrDisplay}" target="_blank" rel="noopener">${esc(addrDisplay)}</a></div>
       <div class="k">Name</div><div>${esc(name)}</div>
       <div class="k">Access control</div><div>${systems.length
         ? systems.map((s) => `<span class="pill info">${s}</span>`).join(" ")
@@ -947,7 +956,7 @@ async function analyze() {
     const state = replay(logs);
     state.am.overrides = amOverrides;
 
-    render({ addr: lc(addr), chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed });
+    render({ addr: lc(addr), addrDisplay: addr, chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed });
     const roleCount = state.classic.rolesSeen.size + state.am.rolesSeen.size;
     setStatus(`Done — ${roleCount} role${roleCount === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
   } catch (e) {
