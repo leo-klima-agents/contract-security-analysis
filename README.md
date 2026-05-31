@@ -32,7 +32,10 @@ It understands four common privilege primitives:
    - AccessManager: `RoleGranted` / `RoleRevoked` / `RoleAdminChanged` /
      `RoleGuardianChanged` / `RoleLabel` (the last supplies human-readable
      names)
-   - Ownable: `OwnershipTransferred`
+   - Ownable / Ownable2Step: `OwnershipTransferred` (the current owner) and
+     `OwnershipTransferStarted` (a *pending* owner proposed via `transferOwnership`
+     but not yet `acceptOwnership`-ed — surfaced separately and cleared on acceptance,
+     renounce, or cancellation)
    - Safe: `SafeSetup` / `AddedOwner` / `RemovedOwner` / `ChangedThreshold` /
      `EnabledModule` / `DisabledModule` / `ChangedGuard` /
      `ChangedFallbackHandler`. The current owner set (rendered as **m-of-n**),

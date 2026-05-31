@@ -202,10 +202,11 @@ const CHAINS = {
  *  - "classic": AccessControl (bytes32 roles) + Ownable
  *  - "am":      AccessManager (uint64 role IDs) */
 const CLASSIC_SIG = {
-  RoleGranted:          "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d",
-  RoleRevoked:          "0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b",
-  RoleAdminChanged:     "0xbd79b86ffe0ab8e8776151514217cd7cacd52c909f66475c3af44e129f0b00ff",
-  OwnershipTransferred: "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0",
+  RoleGranted:              "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d",
+  RoleRevoked:              "0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b",
+  RoleAdminChanged:         "0xbd79b86ffe0ab8e8776151514217cd7cacd52c909f66475c3af44e129f0b00ff",
+  OwnershipTransferred:     "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0",
+  OwnershipTransferStarted: "0x38d16b8cac22d99fc7c124b9cd0de2d3fa1faef420bfe791d8c362d765e22700", // Ownable2Step: proposes a pending owner (no transfer until acceptOwnership)
 };
 const AM_SIG = {
   RoleGranted:         "0xf98448b987f1428e0e230e1f3c6e2ce15b5693eaf31827fbd0b1ec4b424ae7cf", // (uint64,address,uint32,uint48,bool)
@@ -523,7 +524,10 @@ function decodeLogInner(log) {
     ts: log.timeStamp ? parseInt(log.timeStamp, 16) : null,
   };
   if (info.system === "classic") {
-    if (ev.kind !== "OwnershipTransferred" && !hasTopic(topics, 1)) return null;
+    // Ownable / Ownable2Step both carry (previousOwner, newOwner) and may emit them
+    // indexed or in data, so they share a decoder and skip the topic1 pre-check.
+    const isOwnership = ev.kind === "OwnershipTransferred" || ev.kind === "OwnershipTransferStarted";
+    if (!isOwnership && !hasTopic(topics, 1)) return null;
     if ((ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") && !hasTopic(topics, 2)) return null;
     if (ev.kind === "RoleAdminChanged" && !hasTopic(topics, 3)) return null;
     if (ev.kind === "RoleGranted" || ev.kind === "RoleRevoked") {
@@ -532,7 +536,7 @@ function decodeLogInner(log) {
     } else if (ev.kind === "RoleAdminChanged") {
       ev.role = lc(topics[1]);
       ev.newAdminRole = lc(topics[3]);
-    } else if (ev.kind === "OwnershipTransferred") {
+    } else if (isOwnership) {
       // OZ indexes both params; fall back to data if a contract emitted them unindexed.
       if (hasTopic(topics, 1) && hasTopic(topics, 2)) {
         ev.previousOwner = topicToAddress(topics[1]);
@@ -586,6 +590,7 @@ function replay(logs) {
   const am = newSystemState({ guardianOf: new Map(), labels: new Map(), overrides: new Map() });
   const safe = { seen: false, owners: new Set(), modules: new Set(), threshold: null, guard: null, fallbackHandler: null, setup: null };
   let owner = null;
+  let pendingOwner = null; // Ownable2Step: proposed-but-not-yet-accepted owner
   const ownerHistory = [];
 
   const ensure = (sys, role) => {
@@ -626,9 +631,14 @@ function replay(logs) {
       ensure(sys, ev.role); sys.labels.set(ev.role, ev.label);
     } else if (ev.kind === "OwnershipTransferred") {
       owner = ev.newOwner; ownerHistory.push(ev);
+      pendingOwner = null; // acceptance / renounce clears any pending owner (Ownable2Step deletes it)
+    } else if (ev.kind === "OwnershipTransferStarted") {
+      // Proposes a pending owner without transferring. transferOwnership(0) cancels;
+      // re-calling with a new target overwrites. Owner is unchanged either way.
+      pendingOwner = ev.newOwner === ZERO_ADDR ? null : ev.newOwner;
     }
   }
-  return { classic, am, safe, owner, ownerHistory, eventCount: events.length, events };
+  return { classic, am, safe, owner, pendingOwner, ownerHistory, eventCount: events.length, events };
 }
 
 /* ------------------------------------------------------------------ *
@@ -755,6 +765,10 @@ function eventDescription(ev, map, am) {
       if (ev.previousOwner === ZERO_ADDR) return `Ownership initialised to ${addrLink(ev.newOwner)}`;
       if (ev.newOwner === ZERO_ADDR) return `Ownership renounced (was ${addrLink(ev.previousOwner)})`;
       return `Ownership transferred ${addrLink(ev.previousOwner)} → ${addrLink(ev.newOwner)}`;
+    case "OwnershipTransferStarted":
+      return ev.newOwner === ZERO_ADDR
+        ? `Pending ownership transfer cancelled (proposed by ${addrLink(ev.previousOwner)})`
+        : `Ownership transfer started → pending owner ${addrLink(ev.newOwner)} (awaiting acceptance)`;
     // Safe multisig
     case "SafeSetup": {
       const nOwners = (ev.owners || []).length;
@@ -856,23 +870,27 @@ function render(ctx) {
   }
 
   // No access-control activity at all
-  if (!classic.rolesSeen.size && !am.rolesSeen.size && !state.ownerHistory.length && !safe.seen) {
+  if (!classic.rolesSeen.size && !am.rolesSeen.size && !state.ownerHistory.length && !state.pendingOwner && !safe.seen) {
     out.push(`<div class="card"><div class="empty">No AccessControl, AccessManager, Ownable, or Safe multisig events found for this contract since deployment.</div></div>`);
   }
 
   // Ownable
-  if (state.ownerHistory.length) {
+  if (state.ownerHistory.length || state.pendingOwner) {
     out.push(`<div class="card"><h2>Ownable</h2>
       <div class="kv">
         <div class="k">Current owner</div>
         <div class="mono">${state.owner && state.owner !== ZERO_ADDR ? addrLink(state.owner)
           : '<span class="pill warn">renounced</span> <span class="meta">' + esc(ZERO_ADDR) + "</span>"}</div>
       </div>
-      <details style="margin-top:10px"><summary>Ownership history (${state.ownerHistory.length})</summary>
+      ${state.pendingOwner ? `<div class="kv">
+        <div class="k">Pending owner <span class="pill warn">awaiting acceptance</span></div>
+        <div class="mono">${addrLink(state.pendingOwner)}</div>
+      </div>` : ""}
+      ${state.ownerHistory.length ? `<details style="margin-top:10px"><summary>Ownership history (${state.ownerHistory.length})</summary>
         <ul class="holders">${state.ownerHistory.map((e) =>
           `<li>${esc(e.previousOwner)} → ${esc(e.newOwner)} <span class="meta">@ block ${e.block} · ${txLink(e.tx)}</span></li>`
         ).join("")}</ul>
-      </details>
+      </details>` : ""}
     </div>`);
   }
 
