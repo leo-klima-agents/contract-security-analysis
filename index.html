@@ -923,11 +923,20 @@ function renderSafe(safe, verify) {
     if (extra.length) ownersHtml += `<ul class="holders">${extra.map((a) =>
       `<li>${addrLink(a)} <span class="pill bad">owner on-chain — not in events</span></li>`).join("")}</ul>`;
   }
-  // Threshold cross-check.
+  // M-of-N cross-check: verify BOTH the threshold (M) and the owner count (N)
+  // against live state, since a missed owner event skews N without touching M.
   let thrVerify = "";
-  if (v && v.liveThreshold != null) thrVerify = v.liveThreshold === t
-    ? vStatusPill("confirmed")
-    : ` <span class="pill bad">live threshold is ${esc(v.liveThreshold)} ✗</span>`;
+  if (v) {
+    const liveM = v.liveThreshold;                                                   // null if the call failed
+    const liveN = v.liveOwners ? [...v.liveOwners].filter((a) => a && a !== ZERO_ADDR).length : null;
+    if (liveM != null && liveN != null) {
+      thrVerify = (liveM === t && liveN === n)
+        ? vStatusPill("confirmed")
+        : ` <span class="pill bad">live: ${esc(liveM)} of ${esc(liveN)} ✗</span>`;
+    } else if (liveM != null || liveN != null) {
+      thrVerify = vStatusPill("unknown"); // only one half could be read – not fully verified
+    }
+  }
   const modules = [...safe.modules].filter((a) => a && a !== ZERO_ADDR);
   const modPill = (a) => {
     if (!v || !v.modules.has(a)) return "";
