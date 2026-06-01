@@ -65,6 +65,9 @@
   details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
   details[open] summary { margin-bottom: 8px; }
   #status { min-height: 22px; color: var(--muted); font-size: 0.9rem; margin: 4px 2px 0; }
+  .progress { height: 6px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; margin: 8px 2px 0; }
+  .progress-bar { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .2s ease; }
+  .progress-bar.warn { background: var(--warn); }
   .hidden { display: none; }
   h2 { font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin: 0 0 12px; }
   h3 { font-size: 0.95rem; margin: 0; }
@@ -170,6 +173,7 @@ Klima Protocol Treasury=0x75295d12c90d59bd038d7cb7102c466f8017fa25
 Klima Protocol Deployer=0x723cf925e2ceec1586cd060a9a9a60ea3ace7881</textarea>
     </details>
     <div id="status"></div>
+    <div id="progress" class="progress hidden"><div id="progressBar" class="progress-bar"></div></div>
   </div>
 
   <div id="results"></div>
@@ -352,6 +356,19 @@ const addrLink = (a) => {
 const txLink = (h, label) => `<a href="${EXPLORER}/tx/${h}" target="_blank" rel="noopener">${esc(label || h.slice(0, 10) + "…")}</a>`;
 
 function setStatus(msg) { $("status").textContent = msg; }
+
+// Determinate progress bar for the multi-query fetch phase. `failed` tints it
+// amber to signal some queries didn't come back even though others did.
+function setProgress(done, total, failed) {
+  $("progress").classList.remove("hidden");
+  $("progressBar").style.width = (total ? Math.round((done / total) * 100) : 0) + "%";
+  $("progressBar").classList.toggle("warn", !!failed);
+}
+function hideProgress() {
+  $("progress").classList.add("hidden");
+  $("progressBar").style.width = "0";
+  $("progressBar").classList.remove("warn");
+}
 
 async function fetchJSON(url) {
   const res = await fetch(url, { headers: { accept: "application/json" } });
@@ -1034,11 +1051,13 @@ async function analyse() {
     const map = buildRoleNameMap(abiRoleNames, customNames);
 
     setStatus(`Scanning role events since deployment… 0/${ALL_TOPICS.length} queries`);
+    setProgress(0, ALL_TOPICS.length, false);
     const { logs, truncated, failed, failedCount, total } = await fetchRoleLogs(addr, (p) => {
       let msg = `Scanning role events… ${p.done}/${p.total} queries complete`;
       if (p.retrying) msg += ` · ${p.retrying} retry${p.retrying === 1 ? "" : "ies"}`;
       if (p.failedCount) msg += ` · ${p.failedCount} failed`;
       setStatus(msg);
+      setProgress(p.done, p.total, p.failedCount);
     });
 
     setStatus(`Replaying ${logs.length} event${logs.length === 1 ? "" : "s"}…`);
@@ -1053,6 +1072,7 @@ async function analyse() {
     $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable – try again shortly.</div>`;
     setStatus("");
   } finally {
+    hideProgress();
     $("go").disabled = false;
   }
 }
