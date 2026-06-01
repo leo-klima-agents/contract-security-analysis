@@ -93,6 +93,7 @@
   .banner { border-radius: 6px; padding: 8px 12px; font-size: 0.88rem; margin-bottom: 12px; }
   .banner.warn { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.4); color: #e3b341; }
   .banner.bad  { background: rgba(248,81,73,.12);  border: 1px solid rgba(248,81,73,.4);  color: #ff7b72; }
+  .banner.good { background: rgba(63,185,80,.12);  border: 1px solid rgba(63,185,80,.4);  color: #56d364; }
   .meta { color: var(--muted); font-size: 0.8rem; }
   ol.log { list-style: none; counter-reset: log; padding: 0; margin: 0; }
   .log-row {
@@ -118,7 +119,7 @@
 <div class="wrap">
   <header>
     <h1>Contract Access Analyser</h1>
-    <p>Inspect AccessControl / AccessManager roles, Ownable ownership &amp; Safe multisig config of a contract via the BlockScout API.</p>
+    <p>Inspect AccessControl / AccessManager roles, Ownable ownership &amp; Safe multisig config of a contract via the BlockScout API, then validate the reconstructed state against the live contract on-chain.</p>
   </header>
 
   <div class="card">
@@ -180,7 +181,9 @@ Klima Protocol Deployer=0x723cf925e2ceec1586cd060a9a9a60ea3ace7881</textarea>
     Role holders, owners and Safe multisig config are reconstructed by replaying
     <code>RoleGranted</code>/<code>RoleRevoked</code>/<code>RoleAdminChanged</code>, <code>OwnershipTransferred</code>,
     and Safe <code>SafeSetup</code>/<code>AddedOwner</code>/<code>RemovedOwner</code>/<code>ChangedThreshold</code>
-    events since deployment. Labels are best-effort.
+    events since deployment. Labels are best-effort. The <b>Verify on-chain</b> button cross-checks every
+    holder, owner, module &amp; threshold against the live contract via <code>eth_call</code>
+    (<code>hasRole</code> / <code>getOwners</code> / <code>getThreshold</code> / <code>isModuleEnabled</code> / <code>owner</code>).
   </footer>
 </div>
 
@@ -340,9 +343,45 @@ const lc = (s) => s.toLowerCase();
 const topicToAddress = (t) => "0x" + t.slice(-40).toLowerCase();
 const roleHashForName = (name) => (name === "DEFAULT_ADMIN_ROLE" ? DEFAULT_ADMIN_HASH : keccak256(name));
 
+/* ------------------------------------------------------------------ *
+ * On-chain validation: eth_call selectors + ABI encode/decode helpers *
+ * Selectors derived from the same keccak256 used everywhere else, so  *
+ * they can't silently drift from the signatures they claim to be.     *
+ * ------------------------------------------------------------------ */
+const SEL = {
+  hasRoleClassic:  keccak256("hasRole(bytes32,address)").slice(0, 10), // 0x91d14854 → bool
+  hasRoleAm:       keccak256("hasRole(uint64,address)").slice(0, 10),  // 0xd1f856ee → (bool,uint32); first word is the bool
+  owner:           keccak256("owner()").slice(0, 10),                  // 0x8da5cb5b → address
+  getOwners:       keccak256("getOwners()").slice(0, 10),              // 0xa0e67e2b → address[]
+  getThreshold:    keccak256("getThreshold()").slice(0, 10),           // 0xe75235b8 → uint256
+  isModuleEnabled: keccak256("isModuleEnabled(address)").slice(0, 10), // 0x2d9ad53d → bool
+};
+const pad32 = (h) => h.replace(/^0x/, "").toLowerCase().padStart(64, "0");
+const encAddr = (a) => pad32(a);                 // left-pad an address to a 32-byte word
+const encUint = (v) => pad32(BigInt(v).toString(16)); // uint (e.g. AccessManager uint64 role id)
+const encBytes32 = (h) => pad32(h);              // classic role key is already 0x + 64 hex
+// First 32-byte word of a return value, interpreted as a boolean (non-zero ⇒ true).
+const decodeBool = (hex) => typeof hex === "string" && /[1-9a-f]/i.test(hex.slice(2, 66));
+// Decode an ABI-encoded `address[]` return: head word is the offset, then length, then words.
+function decodeAddressArray(hex) {
+  const h = (hex || "").replace(/^0x/, "");
+  if (h.length < 128) return [];
+  const off = parseInt(h.slice(0, 64), 16) * 2;          // byte offset → hex-char index
+  if (!Number.isFinite(off) || off + 64 > h.length) return [];
+  const n = parseInt(h.slice(off, off + 64), 16);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const s = off + 64 + i * 64;
+    if (s + 64 > h.length) break;
+    out.push("0x" + h.slice(s + 24, s + 64).toLowerCase());
+  }
+  return out;
+}
+
 let BASE = "";     // active BlockScout API base URL (data source)
 let EXPLORER = ""; // active canonical block explorer base URL (Etherscan / BaseScan / …)
 let ACCOUNT_LABELS = new Map(); // lowercased address -> human-readable label
+let LAST_CTX = null; // last rendered analysis context (re-rendered with on-chain verification)
 const addrLink = (a) => {
   const link = `<a href="${EXPLORER}/address/${a}" target="_blank" rel="noopener">`;
   const label = a && ACCOUNT_LABELS.get(a.toLowerCase());
@@ -411,6 +450,31 @@ async function fetchRoleLogs(addr) {
     for (const it of r.items) logs.push(it);
   }
   return { logs, truncated, failed };
+}
+
+// Read-only eth_call via the same BlockScout instance's JSON-RPC endpoint
+// (/api/eth-rpc), with the same retry/backoff posture as the log fetcher.
+// Returns the 0x-result hex on success, or null when the call could not be
+// completed (network error, or a JSON-RPC error such as a revert / missing
+// method) – null is treated as "unverifiable", distinct from a decoded `false`.
+async function ethCall(to, data) {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to, data }, "latest"] });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(`${BASE}/api/eth-rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body,
+      });
+      if (res.ok) {
+        const j = await res.json();
+        if (j && typeof j.result === "string") return j.result;
+        if (j && j.error) return null; // revert / unknown method → not verifiable
+      }
+    } catch (_) { /* network error → retry */ }
+    if (attempt < 3) await sleep(400 * (attempt + 1));
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -579,7 +643,9 @@ function decodeLogInner(log) {
 }
 
 function newSystemState(extra) {
-  return Object.assign({ holders: new Map(), adminOf: new Map(), counts: new Map(), rolesSeen: new Set() }, extra || {});
+  // `everAccounts` (role → every account ever granted/revoked) is the universe the
+  // on-chain validator checks: "is or has been assigned", incl. since-revoked accounts.
+  return Object.assign({ holders: new Map(), adminOf: new Map(), counts: new Map(), rolesSeen: new Set(), everAccounts: new Map() }, extra || {});
 }
 
 function replay(logs) {
@@ -588,7 +654,7 @@ function replay(logs) {
 
   const classic = newSystemState();
   const am = newSystemState({ guardianOf: new Map(), labels: new Map(), overrides: new Map() });
-  const safe = { seen: false, owners: new Set(), modules: new Set(), threshold: null, guard: null, fallbackHandler: null, setup: null };
+  const safe = { seen: false, owners: new Set(), modules: new Set(), threshold: null, guard: null, fallbackHandler: null, setup: null, everOwners: new Set(), everModules: new Set() };
   let owner = null;
   let pendingOwner = null; // Ownable2Step: proposed-but-not-yet-accepted owner
   const ownerHistory = [];
@@ -597,20 +663,21 @@ function replay(logs) {
     sys.rolesSeen.add(role);
     if (!sys.holders.has(role)) sys.holders.set(role, new Set());
     if (!sys.counts.has(role)) sys.counts.set(role, { granted: 0, revoked: 0 });
+    if (!sys.everAccounts.has(role)) sys.everAccounts.set(role, new Set());
   };
 
   const applySafe = (ev) => {
     safe.seen = true;
     switch (ev.kind) {
       case "SafeSetup":
-        (ev.owners || []).forEach((o) => safe.owners.add(o));
+        (ev.owners || []).forEach((o) => { safe.owners.add(o); safe.everOwners.add(o); });
         if (ev.threshold != null) safe.threshold = ev.threshold;
         safe.fallbackHandler = ev.fallbackHandler; safe.setup = ev; break;
-      case "AddedOwner":              safe.owners.add(ev.account); break;
-      case "RemovedOwner":            safe.owners.delete(ev.account); break;
+      case "AddedOwner":              safe.owners.add(ev.account); safe.everOwners.add(ev.account); break;
+      case "RemovedOwner":            safe.owners.delete(ev.account); safe.everOwners.add(ev.account); break;
       case "ChangedThreshold":        safe.threshold = ev.threshold; break;
-      case "EnabledModule":           safe.modules.add(ev.account); break;
-      case "DisabledModule":          safe.modules.delete(ev.account); break;
+      case "EnabledModule":           safe.modules.add(ev.account); safe.everModules.add(ev.account); break;
+      case "DisabledModule":          safe.modules.delete(ev.account); safe.everModules.add(ev.account); break;
       case "ChangedGuard":            safe.guard = ev.account; break;
       case "ChangedFallbackHandler":  safe.fallbackHandler = ev.account; break;
     }
@@ -621,8 +688,10 @@ function replay(logs) {
     const sys = ev.system === "am" ? am : classic;
     if (ev.kind === "RoleGranted") {
       ensure(sys, ev.role); sys.holders.get(ev.role).add(ev.account); sys.counts.get(ev.role).granted++;
+      sys.everAccounts.get(ev.role).add(ev.account);
     } else if (ev.kind === "RoleRevoked") {
       ensure(sys, ev.role); sys.holders.get(ev.role).delete(ev.account); sys.counts.get(ev.role).revoked++;
+      sys.everAccounts.get(ev.role).add(ev.account);
     } else if (ev.kind === "RoleAdminChanged") {
       ensure(sys, ev.role); sys.adminOf.set(ev.role, ev.system === "am" ? ev.target : ev.newAdminRole);
     } else if (ev.kind === "RoleGuardianChanged") {
@@ -642,20 +711,144 @@ function replay(logs) {
 }
 
 /* ------------------------------------------------------------------ *
+ * On-chain validation                                                 *
+ * Cross-checks the replayed state against live contract storage via   *
+ * eth_call. For every account that is or has been assigned a role we   *
+ * ask the contract whether it *currently* holds it, then compare with  *
+ * what the event replay concluded.                                     *
+ * ------------------------------------------------------------------ */
+// Run async task factories with bounded concurrency, reporting progress.
+async function runPool(tasks, limit, onProgress) {
+  let next = 0, done = 0;
+  const total = tasks.length;
+  const worker = async () => {
+    while (next < total) {
+      const i = next++;
+      await tasks[i]();
+      onProgress && onProgress(++done, total);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, total) }, worker));
+}
+
+async function validateOnChain(addr, state, onProgress) {
+  const v = {
+    classic: new Map(), am: new Map(),                 // roleKey → Map(account → "confirmed"|"stale"|"unknown")
+    extra: { classic: new Map(), am: new Map() },      // roleKey → Set(account) live but absent from replay holders
+    safe: { liveOwners: null, liveThreshold: null, modules: new Map() },
+    ownable: { live: undefined },                      // undefined = not checked, null = call failed
+    checks: 0, confirmed: 0, discrepancies: 0, unverified: 0,
+  };
+  const tasks = [];
+
+  // Classify one (system, role, account) hasRole result against the replay.
+  const recordRole = (sysKey, role, account, hex) => {
+    const expected = state[sysKey].holders.has(role) && state[sysKey].holders.get(role).has(account);
+    if (!v[sysKey].has(role)) v[sysKey].set(role, new Map());
+    if (hex === null) { v[sysKey].get(role).set(account, "unknown"); v.unverified++; return; }
+    const onChain = decodeBool(hex);
+    if (onChain === expected) {
+      v[sysKey].get(role).set(account, "confirmed"); v.confirmed++;
+    } else if (expected && !onChain) {
+      v[sysKey].get(role).set(account, "stale"); v.discrepancies++;     // replay shows a holder the chain doesn't
+    } else {                                                            // !expected && onChain → replay missed a live holder
+      if (!v.extra[sysKey].has(role)) v.extra[sysKey].set(role, new Set());
+      v.extra[sysKey].get(role).add(account); v.discrepancies++;
+    }
+  };
+
+  for (const [role, accts] of state.classic.everAccounts)
+    for (const a of accts)
+      tasks.push(async () => recordRole("classic", role, a, await ethCall(addr, SEL.hasRoleClassic + encBytes32(role) + encAddr(a))));
+  for (const [role, accts] of state.am.everAccounts)
+    for (const a of accts)
+      tasks.push(async () => recordRole("am", role, a, await ethCall(addr, SEL.hasRoleAm + encUint(role) + encAddr(a))));
+
+  // Safe: getOwners()/getThreshold() give the authoritative live set in one call
+  // each; modules are probed individually via isModuleEnabled(address).
+  if (state.safe.seen) {
+    tasks.push(async () => {
+      const hex = await ethCall(addr, SEL.getOwners);
+      if (hex === null) { v.unverified++; return; }
+      v.safe.liveOwners = new Set(decodeAddressArray(hex));
+    });
+    tasks.push(async () => {
+      const hex = await ethCall(addr, SEL.getThreshold);
+      if (hex === null) { v.unverified++; return; }
+      v.safe.liveThreshold = parseInt(hex.slice(2, 66), 16);
+    });
+    for (const m of state.safe.everModules)
+      tasks.push(async () => {
+        const hex = await ethCall(addr, SEL.isModuleEnabled + encAddr(m));
+        v.safe.modules.set(m, hex === null ? null : decodeBool(hex));
+        if (hex === null) v.unverified++;
+      });
+  }
+
+  // Ownable: one owner() call compared to the replayed owner.
+  if (state.ownerHistory.length || state.pendingOwner) {
+    tasks.push(async () => {
+      const hex = await ethCall(addr, SEL.owner);
+      v.ownable.live = hex === null ? null : "0x" + hex.slice(26, 66).toLowerCase();
+      if (hex === null) v.unverified++;
+    });
+  }
+
+  await runPool(tasks, 8, onProgress);
+
+  // Tally Safe/Ownable findings (per-role hasRole checks were tallied inline above).
+  if (v.safe.liveOwners) {
+    const replayed = new Set([...state.safe.owners].map(lc));
+    for (const o of replayed) (v.safe.liveOwners.has(o) ? v.confirmed++ : v.discrepancies++); // replay owner live?
+    for (const o of v.safe.liveOwners) if (!replayed.has(o)) v.discrepancies++;               // live owner replay missed
+  }
+  if (v.safe.liveThreshold != null && state.safe.threshold != null)
+    (v.safe.liveThreshold === state.safe.threshold ? v.confirmed++ : v.discrepancies++);
+  for (const [m, on] of v.safe.modules) {
+    if (on === null) continue;
+    (on === state.safe.modules.has(m) ? v.confirmed++ : v.discrepancies++);
+  }
+  if (v.ownable.live !== undefined && v.ownable.live !== null) {
+    const replayedOwner = (state.owner || ZERO_ADDR).toLowerCase();
+    (v.ownable.live === replayedOwner ? v.confirmed++ : v.discrepancies++);
+  }
+
+  // `checks` is the number of comparisons made, so the summary always sums up:
+  // confirmed + discrepancies + unverified.
+  v.checks = v.confirmed + v.discrepancies + v.unverified;
+  return v;
+}
+
+/* ------------------------------------------------------------------ *
  * Rendering                                                           *
  * ------------------------------------------------------------------ */
 function labelFor(map, hash) {
   return hash ? (map[lc(hash)] || null) : null;
 }
 
+// On-chain verification status → pill. confirmed = live state agrees with replay,
+// stale = replay shows a holder the chain doesn't, unknown = call couldn't complete.
+function vStatusPill(status) {
+  if (status === "confirmed") return ' <span class="pill good">on-chain ✓</span>';
+  if (status === "stale")     return ' <span class="pill bad">not on-chain ✗</span>';
+  if (status === "unknown")   return ' <span class="pill warn">unverified</span>';
+  return "";
+}
+
 // Generic role card. `label`/`adminText` are pre-resolved display strings;
 // `idText` is the raw identifier (bytes32 hash or uint64 id) shown verbatim.
-function renderRoleCard(label, idText, adminText, counts, holderSet, extraMeta) {
+// `vAccounts` (account → status) and `vExtra` (live holders absent from the
+// event replay) are present only after on-chain verification has run.
+function renderRoleCard(label, idText, adminText, counts, holderSet, extraMeta, vAccounts, vExtra) {
   const c = counts || { granted: 0, revoked: 0 };
   const accounts = [...holderSet];
-  const holdersHtml = accounts.length
-    ? `<ul class="holders">${accounts.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
+  let holdersHtml = accounts.length
+    ? `<ul class="holders">${accounts.map((a) => `<li>${addrLink(a)}${vAccounts ? vStatusPill(vAccounts.get(a)) : ""}</li>`).join("")}</ul>`
     : `<div class="empty">No current holders (all granted roles were revoked).</div>`;
+  if (vExtra && vExtra.size) {
+    holdersHtml += `<ul class="holders">${[...vExtra].map((a) =>
+      `<li>${addrLink(a)} <span class="pill bad">holds on-chain — no grant event</span></li>`).join("")}</ul>`;
+  }
   return `<div class="role">
     <div class="role-head">
       <h3>${label ? esc(label) : '<span class="meta">Unknown role</span>'}
@@ -670,7 +863,7 @@ function renderRoleCard(label, idText, adminText, counts, holderSet, extraMeta) 
 }
 
 // Classic AccessControl (bytes32) roles, labelled via the keccak256 dictionary.
-function renderClassicRoles(state, map) {
+function renderClassicRoles(state, map, verify) {
   const roles = [...state.rolesSeen];
   roles.sort((a, b) => {
     if (a === DEFAULT_ADMIN_HASH) return -1;
@@ -684,7 +877,8 @@ function renderClassicRoles(state, map) {
     const adminRole = state.adminOf.get(r) || DEFAULT_ADMIN_HASH;
     const adminLabel = labelFor(map, adminRole);
     const adminText = adminLabel ? esc(adminLabel) : `<span class="mono">${esc(adminRole.slice(0, 14))}…</span>`;
-    return renderRoleCard(labelFor(map, r), r, adminText, state.counts.get(r), state.holders.get(r));
+    return renderRoleCard(labelFor(map, r), r, adminText, state.counts.get(r), state.holders.get(r), null,
+      verify && verify.classic.get(r), verify && verify.extra.classic.get(r));
   }).join("");
 }
 
@@ -693,7 +887,7 @@ function amRoleLabel(am, id) {
   return (am.overrides && am.overrides.get(id)) || am.labels.get(id) ||
     (id === AM_ADMIN_ROLE_ID ? "ADMIN_ROLE" : id === AM_PUBLIC_ROLE_ID ? "PUBLIC_ROLE" : null);
 }
-function renderAmRoles(am) {
+function renderAmRoles(am, verify) {
   const roles = [...am.rolesSeen];
   roles.sort((a, b) => BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0);
   return roles.map((id) => {
@@ -702,32 +896,53 @@ function renderAmRoles(am) {
     const adminText = `${esc(amRoleLabel(am, adminId) || ("role " + adminId))} <span class="meta">(id ${esc(adminId)})</span>`;
     const guardianId = am.guardianOf.get(id);
     const extra = guardianId ? `guardian: ${esc(amRoleLabel(am, guardianId) || ("role " + guardianId))}` : "";
-    return renderRoleCard(label, `role id ${id}`, adminText, am.counts.get(id), am.holders.get(id), extra);
+    return renderRoleCard(label, `role id ${id}`, adminText, am.counts.get(id), am.holders.get(id), extra,
+      verify && verify.am.get(id), verify && verify.extra.am.get(id));
   }).join("");
 }
 
 // Safe multisig: current owners, threshold (m-of-n), modules & guard. Modules and
 // low thresholds are flagged because they widen who can move the Safe's assets.
-function renderSafe(safe) {
+function renderSafe(safe, verify) {
   const owners = [...safe.owners].filter((a) => a && a !== ZERO_ADDR);
   const n = owners.length;
   const t = safe.threshold;
   // Flag thresholds that don't require a real majority (1-of-n, or m where 2m ≤ n).
   const weak = t != null && n > 1 && (t <= 1 || t * 2 <= n);
   const thrText = t != null ? `${t} of ${n}` : `unknown of ${n}`;
-  const ownersHtml = owners.length
-    ? `<ul class="holders">${owners.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
+  const v = verify && verify.safe;
+  const live = v && v.liveOwners;
+  // Per-owner verification against the live getOwners() set.
+  const ownerPill = (a) => live ? (live.has(lc(a)) ? vStatusPill("confirmed") : vStatusPill("stale")) : "";
+  let ownersHtml = owners.length
+    ? `<ul class="holders">${owners.map((a) => `<li>${addrLink(a)}${ownerPill(a)}</li>`).join("")}</ul>`
     : `<div class="empty">No current owners found (event history may be incomplete).</div>`;
+  if (live) { // live owners the replay didn't reconstruct
+    const replayed = new Set(owners.map(lc));
+    const extra = [...live].filter((a) => !replayed.has(a) && a !== ZERO_ADDR);
+    if (extra.length) ownersHtml += `<ul class="holders">${extra.map((a) =>
+      `<li>${addrLink(a)} <span class="pill bad">owner on-chain — not in events</span></li>`).join("")}</ul>`;
+  }
+  // Threshold cross-check.
+  let thrVerify = "";
+  if (v && v.liveThreshold != null) thrVerify = v.liveThreshold === t
+    ? vStatusPill("confirmed")
+    : ` <span class="pill bad">live threshold is ${esc(v.liveThreshold)} ✗</span>`;
   const modules = [...safe.modules].filter((a) => a && a !== ZERO_ADDR);
+  const modPill = (a) => {
+    if (!v || !v.modules.has(a)) return "";
+    const on = v.modules.get(a);
+    return on === null ? vStatusPill("unknown") : (on ? vStatusPill("confirmed") : vStatusPill("stale"));
+  };
   const modulesHtml = modules.length
     ? `<div class="banner warn">⚠ Enabled modules can execute transactions <b>without</b> owner signatures.</div>
-       <ul class="holders">${modules.map((a) => `<li>${addrLink(a)}</li>`).join("")}</ul>`
+       <ul class="holders">${modules.map((a) => `<li>${addrLink(a)}${modPill(a)}</li>`).join("")}</ul>`
     : `<div class="empty">No modules enabled.</div>`;
   const addrOrNone = (a) => (a && a !== ZERO_ADDR) ? addrLink(a) : '<span class="meta">none</span>';
   return `<div class="card"><h2>Safe Multisig</h2>
     <div class="kv">
       <div class="k">Threshold</div>
-      <div><span class="pill ${weak ? "warn" : "good"}">${esc(thrText)}</span> signature${t === 1 ? "" : "s"} required to execute</div>
+      <div><span class="pill ${weak ? "warn" : "good"}">${esc(thrText)}</span> signature${t === 1 ? "" : "s"} required to execute${thrVerify}</div>
       <div class="k">Owners (${n})</div><div>${ownersHtml}</div>
       <div class="k">Modules (${modules.length})</div><div>${modulesHtml}</div>
       <div class="k">Guard</div><div>${addrOrNone(safe.guard)}</div>
@@ -843,9 +1058,20 @@ function render(ctx) {
     out.push(`<div class="banner warn">⚠ One or more event queries hit BlockScout's 1000-log limit; holder lists may be incomplete for this very high-volume contract.</div>`);
   }
 
+  // On-chain validation control: lets the user cross-check the event-replayed
+  // state against live contract storage. Only shown when there's something to verify.
+  const hasVerifiable = classic.rolesSeen.size || am.rolesSeen.size || safe.seen || state.ownerHistory.length || state.pendingOwner;
+  if (hasVerifiable) {
+    out.push(`<div class="card">
+      ${ctx.verify ? verifySummary(ctx.verify) : ""}
+      <button id="verifyBtn">${ctx.verify ? "Re-verify on-chain" : "Verify on-chain"}</button>
+      <span class="meta" style="margin-left:8px">Cross-checks every current &amp; past role holder, owner, module &amp; threshold against the live contract via <code>eth_call</code> (<code>hasRole</code> / <code>getOwners</code> / <code>isModuleEnabled</code> / <code>owner</code>).</span>
+    </div>`);
+  }
+
   // Safe multisig (owners / threshold / modules / guard)
   if (safe.seen) {
-    out.push(renderSafe(safe));
+    out.push(renderSafe(safe, ctx.verify));
   }
 
   // Roles declared by the ABI (classic bytes32 constants)
@@ -861,12 +1087,12 @@ function render(ctx) {
 
   // Classic AccessControl holders
   if (classic.rolesSeen.size) {
-    out.push(`<div class="card"><h2>AccessControl role holders</h2>${renderClassicRoles(classic, map)}</div>`);
+    out.push(`<div class="card"><h2>AccessControl role holders</h2>${renderClassicRoles(classic, map, ctx.verify)}</div>`);
   }
 
   // AccessManager holders
   if (am.rolesSeen.size) {
-    out.push(`<div class="card"><h2>AccessManager roles <span class="meta">(uint64 role IDs)</span></h2>${renderAmRoles(am)}</div>`);
+    out.push(`<div class="card"><h2>AccessManager roles <span class="meta">(uint64 role IDs)</span></h2>${renderAmRoles(am, ctx.verify)}</div>`);
   }
 
   // No access-control activity at all
@@ -881,6 +1107,11 @@ function render(ctx) {
         <div class="k">Current owner</div>
         <div class="mono">${state.owner && state.owner !== ZERO_ADDR ? addrLink(state.owner)
           : '<span class="pill warn">renounced</span> <span class="meta">' + esc(ZERO_ADDR) + "</span>"}</div>
+        ${ctx.verify && ctx.verify.ownable.live !== undefined ? `<div class="k">Live owner()</div>
+        <div class="mono">${ctx.verify.ownable.live === null ? '<span class="pill warn">unverified</span>'
+          : (ctx.verify.ownable.live === (state.owner || ZERO_ADDR).toLowerCase()
+            ? addrLink(ctx.verify.ownable.live) + vStatusPill("confirmed")
+            : addrLink(ctx.verify.ownable.live) + ' <span class="pill bad">differs from replay ✗</span>')}</div>` : ""}
       </div>
       ${state.pendingOwner ? `<div class="kv">
         <div class="k">Pending owner <span class="pill warn">awaiting acceptance</span></div>
@@ -898,6 +1129,43 @@ function render(ctx) {
   out.push(renderAuditLog(state.events, map, am));
 
   $("results").innerHTML = out.join("");
+
+  // Remember the context so the "Verify on-chain" button can re-render with
+  // live-state annotations, and wire the button up (innerHTML drops listeners).
+  LAST_CTX = ctx;
+  const verifyBtn = $("verifyBtn");
+  if (verifyBtn) verifyBtn.addEventListener("click", runVerification);
+}
+
+// One-line summary banner of an on-chain verification pass.
+function verifySummary(verify) {
+  const { checks, confirmed, discrepancies, unverified } = verify;
+  const cls = discrepancies ? "bad" : (unverified ? "warn" : "good");
+  const head = discrepancies
+    ? `⚠ ${discrepancies} discrepanc${discrepancies === 1 ? "y" : "ies"} between the event replay and live on-chain state`
+    : (unverified
+        ? `Replay matches live state where checked, but ${unverified} call${unverified === 1 ? "" : "s"} could not be completed`
+        : `✓ Live on-chain state matches the event replay`);
+  return `<div class="banner ${cls}" style="margin-bottom:12px">${head}
+    <span class="meta">— ${checks} check${checks === 1 ? "" : "s"} · ${confirmed} confirmed · ${discrepancies} discrepanc${discrepancies === 1 ? "y" : "ies"} · ${unverified} unverified</span></div>`;
+}
+
+// Run an on-chain verification pass against the last analysed contract and
+// re-render the results with confirmed/stale/extra annotations.
+async function runVerification() {
+  if (!LAST_CTX) return;
+  const btn = $("verifyBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "Verifying…"; }
+  try {
+    setStatus("Verifying on-chain…");
+    const verify = await validateOnChain(LAST_CTX.addr, LAST_CTX.state,
+      (done, total) => setStatus(`Verifying on-chain… ${done}/${total}`));
+    render(Object.assign({}, LAST_CTX, { verify }));
+    setStatus(`On-chain validation: ${verify.confirmed} confirmed · ${verify.discrepancies} discrepanc${verify.discrepancies === 1 ? "y" : "ies"} · ${verify.unverified} unverified.`);
+  } catch (e) {
+    setStatus("On-chain validation failed: " + (e.message || String(e)));
+    if (btn) { btn.disabled = false; btn.textContent = "Verify on-chain"; }
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -986,7 +1254,7 @@ async function analyse() {
 }
 
 $("go").addEventListener("click", analyse);
-$("address").addEventListener("keydown", (e) => { if (e.key === "Enter") analyze(); });
+$("address").addEventListener("keydown", (e) => { if (e.key === "Enter") analyse(); });
 </script>
 </body>
 </html>

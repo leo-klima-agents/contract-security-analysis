@@ -55,6 +55,25 @@ It understands four common privilege primitives:
    on the chain's canonical explorer (Etherscan / BaseScan / PolygonScan /
    Arbiscan).
 
+4. **On-chain validation (optional).**
+   Because the holder/owner state above is *reconstructed from events*, it can
+   drift from reality (a missed `Revoke`, a truncated log query, or a grant made
+   without the standard event). After analysing, click **Verify on-chain** to
+   cross-check the reconstruction against live contract storage. For every
+   account that is or has ever been assigned a role, the tool issues a read-only
+   `eth_call` and compares the live answer to the replay:
+   - AccessControl → `hasRole(bytes32,address)`
+   - AccessManager → `hasRole(uint64,address)`
+   - Safe → `getOwners()`, `getThreshold()`, `isModuleEnabled(address)`
+   - Ownable → `owner()`
+
+   Each current holder/owner is then annotated **on-chain ✓** (confirmed),
+   **not on-chain ✗** (the replay shows a holder the contract doesn't), or
+   **unverified** (the call couldn't complete); any live holder the replay
+   *missed* is surfaced too. A summary banner reports the totals. The calls go to
+   the **same BlockScout instance** used for everything else, via its JSON-RPC
+   endpoint (`/api/eth-rpc`).
+
 AccessControl role hashes are labelled best-effort by matching against
 `keccak256(name)` for a built-in dictionary of common OpenZeppelin role names,
 any names found in the ABI, and any custom names you supply. AccessManager roles
@@ -96,6 +115,10 @@ Pushes to `main` are published to **GitHub Pages** automatically by
 ## Notes & limitations
 
 - Holder lists come from event replay; a query that hits BlockScout's 1000-log
-  limit for a single event type is flagged as potentially incomplete.
+  limit for a single event type is flagged as potentially incomplete. Use
+  **Verify on-chain** to confirm the reconstructed holders against live state.
 - Role labels are heuristic: a contract may define a role as something other
   than `keccak256("THE_NAME")`. The raw `bytes32` hash is always shown.
+- On-chain validation reflects the contract's state **now** (`latest` block),
+  while the audit log is historical; an account correctly revoked in the past is
+  consistent with — not contradicted by — a live `false`.
