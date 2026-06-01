@@ -736,7 +736,7 @@ async function validateOnChain(addr, state, onProgress) {
     classic: new Map(), am: new Map(),                 // roleKey → Map(account → "confirmed"|"stale"|"unknown")
     extra: { classic: new Map(), am: new Map() },      // roleKey → Set(account) live but absent from replay holders
     safe: { liveOwners: null, liveThreshold: null, modules: new Map() },
-    ownable: { live: undefined },                      // undefined = not checked, null = call failed
+    ownable: { live: undefined, accounts: null },      // live: undefined=not checked, null=call failed; accounts: addr→status
     checks: 0, confirmed: 0, discrepancies: 0, unverified: 0,
   };
   const tasks = [];
@@ -785,12 +785,38 @@ async function validateOnChain(addr, state, onProgress) {
       });
   }
 
-  // Ownable: one owner() call compared to the replayed owner.
+  // Ownable: a single owner() read tells us the live owner; we then check every
+  // address that has *ever* been the owner against it — the current one confirmed
+  // as still owner, each former one confirmed as no longer owner (mirroring how
+  // revoked role holders are confirmed gone). A live owner the events never
+  // recorded is surfaced as a discrepancy.
   if (state.ownerHistory.length || state.pendingOwner) {
+    const everOwners = new Set();
+    for (const e of state.ownerHistory) {
+      if (e.previousOwner && e.previousOwner !== ZERO_ADDR) everOwners.add(lc(e.previousOwner));
+      if (e.newOwner && e.newOwner !== ZERO_ADDR) everOwners.add(lc(e.newOwner));
+    }
+    v.ownable.accounts = new Map();
     tasks.push(async () => {
       const hex = await ethCall(addr, SEL.owner);
-      v.ownable.live = hex === null ? null : "0x" + hex.slice(26, 66).toLowerCase();
-      if (hex === null) v.unverified++;
+      if (hex === null) {
+        v.ownable.live = null;
+        for (const a of everOwners) { v.ownable.accounts.set(a, "unknown"); v.unverified++; }
+        return;
+      }
+      const live = "0x" + hex.slice(26, 66).toLowerCase();
+      v.ownable.live = live;
+      if (live !== ZERO_ADDR) everOwners.add(live); // a live owner the events missed still gets checked
+      const current = (state.owner || ZERO_ADDR).toLowerCase();
+      for (const a of everOwners) {
+        const isLive = a === live, isCurrent = a === current;
+        const status = (isCurrent && isLive) ? "confirmed-current"
+          : (!isCurrent && !isLive) ? "confirmed-former"
+          : isCurrent ? "stale"   // replay's current owner isn't the live owner
+          : "extra";              // live owner the replay doesn't show as current
+        v.ownable.accounts.set(a, status);
+        (status.startsWith("confirmed") ? v.confirmed++ : v.discrepancies++);
+      }
     });
   }
 
@@ -808,10 +834,8 @@ async function validateOnChain(addr, state, onProgress) {
     if (on === null) continue;
     (on === state.safe.modules.has(m) ? v.confirmed++ : v.discrepancies++);
   }
-  if (v.ownable.live !== undefined && v.ownable.live !== null) {
-    const replayedOwner = (state.owner || ZERO_ADDR).toLowerCase();
-    (v.ownable.live === replayedOwner ? v.confirmed++ : v.discrepancies++);
-  }
+  // (Ownable findings are tallied inside its task above, since one owner() read
+  // is compared against every address that was ever the owner.)
 
   // `checks` is the number of comparisons made, so the summary always sums up:
   // confirmed + discrepancies + unverified.
@@ -833,6 +857,19 @@ function vStatusPill(status) {
   if (status === "stale")     return ' <span class="pill bad">not on-chain ✗</span>';
   if (status === "unknown")   return ' <span class="pill warn">unverified</span>';
   return "";
+}
+
+// Ownable per-owner verification pill (an owner is single-valued on-chain, so the
+// wording differs from role holders: a former owner is *expected* not to be live).
+function ownerStatusPill(status) {
+  switch (status) {
+    case "confirmed-current": return ' <span class="pill good">live owner ✓</span>';
+    case "confirmed-former":  return ' <span class="pill good">former — not live owner ✓</span>';
+    case "stale":             return ' <span class="pill bad">not the live owner ✗</span>';
+    case "extra":             return ' <span class="pill bad">is the live owner — not in events ✗</span>';
+    case "unknown":           return ' <span class="pill warn">unverified</span>';
+    default: return "";
+  }
 }
 
 // Generic role card. `label`/`adminText` are pre-resolved display strings;
@@ -1126,11 +1163,13 @@ function render(ctx) {
         <div class="k">Pending owner <span class="pill warn">awaiting acceptance</span></div>
         <div class="mono">${addrLink(state.pendingOwner)}</div>
       </div>` : ""}
-      ${state.ownerHistory.length ? `<details style="margin-top:10px"><summary>Ownership history (${state.ownerHistory.length})</summary>
+      ${state.ownerHistory.length ? (() => {
+        const va = ctx.verify && ctx.verify.ownable.accounts;
+        return `<details style="margin-top:10px" ${va ? "open" : ""}><summary>Ownership history (${state.ownerHistory.length})${va ? ' <span class="meta">— each owner checked against the live owner()</span>' : ""}</summary>
         <ul class="holders">${state.ownerHistory.map((e) =>
-          `<li>${esc(e.previousOwner)} → ${esc(e.newOwner)} <span class="meta">@ block ${e.block} · ${txLink(e.tx)}</span></li>`
-        ).join("")}</ul>
-      </details>` : ""}
+          `<li>${esc(e.previousOwner)} → ${esc(e.newOwner)}${va ? ownerStatusPill(va.get(lc(e.newOwner))) : ""} <span class="meta">@ block ${e.block} · ${txLink(e.tx)}</span></li>`
+        ).join("")}</ul></details>`;
+      })() : ""}
     </div>`);
   }
 
