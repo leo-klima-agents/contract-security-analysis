@@ -356,7 +356,28 @@ const addrLink = (a) => {
 };
 const txLink = (h, label) => `<a href="${EXPLORER}/tx/${h}" target="_blank" rel="noopener">${esc(label || h.slice(0, 10) + "…")}</a>`;
 
-function setStatus(msg) { $("status").textContent = msg; }
+// Status line with an animated spinner + elapsed timer so the user can see the
+// tool is still working during a single long-running request (e.g. a slow
+// metadata fetch) where there's no incremental progress to report.
+const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+let _spinTimer = null, _spinFrame = 0, _spinLabel = "", _spinStart = 0;
+function renderStatus() {
+  if (!_spinTimer) { $("status").textContent = _spinLabel; return; }
+  const secs = Math.floor((Date.now() - _spinStart) / 1000);
+  const elapsed = secs >= 1 ? ` (${secs}s)` : "";
+  $("status").textContent = `${SPIN[_spinFrame % SPIN.length]} ${_spinLabel}${elapsed}`;
+}
+function setStatus(msg) { _spinLabel = msg; renderStatus(); }
+function startSpinner() {
+  if (_spinTimer) return;
+  _spinFrame = 0; _spinStart = Date.now();
+  _spinTimer = setInterval(() => { _spinFrame++; renderStatus(); }, 120);
+  renderStatus();
+}
+function stopSpinner() {
+  if (_spinTimer) { clearInterval(_spinTimer); _spinTimer = null; }
+  renderStatus();
+}
 
 // Determinate progress bar for the multi-query fetch phase. Splits settled
 // queries into a green (succeeded) and red (failed) segment; the unfilled
@@ -1026,16 +1047,18 @@ async function analyse() {
   });
 
   $("go").disabled = true;
+  startSpinner();
   try {
-    setStatus("Fetching contract metadata…");
+    setStatus(`Fetching contract metadata for ${addr.slice(0, 8)}…${addr.slice(-6)}`);
     const info = await fetchAddressInfo(addr);
 
     // Proxy / implementation resolution
     const isProxy = !!(info && (info.proxy_type || (info.implementations && info.implementations.length)));
     const implAddr = info && info.implementations && info.implementations.length
       ? info.implementations[0].address_hash : null;
+    if (isProxy) setStatus("Proxy detected – resolving implementation…");
 
-    setStatus("Fetching ABI…");
+    setStatus("Fetching contract ABI…");
     let abi = [];
     let abiAvailable = false;
     const own = await fetchAbi(addr);
@@ -1045,6 +1068,7 @@ async function analyse() {
     const implCandidates = [implAddr, own && own.twin].filter((a) => a && isAddress(a) && lc(a) !== lc(addr));
     for (const cand of implCandidates) {
       try {
+        setStatus(`Fetching implementation ABI (${cand.slice(0, 8)}…${cand.slice(-6)})…`);
         const implAbi = await fetchAbi(cand);
         if (implAbi && implAbi.abi.length) { abi = abi.concat(implAbi.abi); abiAvailable = true; break; }
       } catch (_) { /* ignore */ }
@@ -1057,7 +1081,7 @@ async function analyse() {
     setProgress(0, ALL_TOPICS.length, 0);
     const { logs, truncated, failed, failedCount, total } = await fetchRoleLogs(addr, (p) => {
       let msg = `Scanning role events… ${p.done}/${p.total} queries complete`;
-      if (p.retrying) msg += ` · ${p.retrying} retry${p.retrying === 1 ? "" : "ies"}`;
+      if (p.retrying) msg += ` · ${p.retrying} ${p.retrying === 1 ? "retry" : "retries"}`;
       if (p.failedCount) msg += ` · ${p.failedCount} failed`;
       setStatus(msg);
       setProgress(p.done, p.total, p.failedCount);
@@ -1075,6 +1099,7 @@ async function analyse() {
     $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable – try again shortly.</div>`;
     setStatus("");
   } finally {
+    stopSpinner();
     hideProgress();
     $("go").disabled = false;
   }
