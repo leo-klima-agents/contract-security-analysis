@@ -65,6 +65,18 @@
   details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
   details[open] summary { margin-bottom: 8px; }
   #status { min-height: 22px; color: var(--muted); font-size: 0.9rem; margin: 4px 2px 0; }
+  .progress { display: flex; height: 6px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; margin: 8px 2px 0; }
+  .progress-bar { height: 100%; width: 0; transition: width .2s ease; }
+  .progress-bar.good { background: var(--good); }
+  .progress-bar.bad  { background: var(--bad); }
+  .fetchlog {
+    margin: 8px 2px 0; max-height: 132px; overflow-y: auto;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-family: var(--mono); font-size: 0.78rem; line-height: 1.45;
+  }
+  .fetchlog div { color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+  .fetchlog div.warn { color: var(--warn); }
+  .fetchlog div.bad  { color: var(--bad); }
   .hidden { display: none; }
   h2 { font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin: 0 0 12px; }
   h3 { font-size: 0.95rem; margin: 0; }
@@ -171,6 +183,8 @@ Klima Protocol Treasury=0x75295d12c90d59bd038d7cb7102c466f8017fa25
 Klima Protocol Deployer=0x723cf925e2ceec1586cd060a9a9a60ea3ace7881</textarea>
     </details>
     <div id="status"></div>
+    <div id="progress" class="progress hidden"><div id="progressGood" class="progress-bar good"></div><div id="progressBad" class="progress-bar bad"></div></div>
+    <div id="fetchlog" class="fetchlog hidden"></div>
   </div>
 
   <div id="results"></div>
@@ -392,6 +406,43 @@ const txLink = (h, label) => `<a href="${EXPLORER}/tx/${h}" target="_blank" rel=
 
 function setStatus(msg) { $("status").textContent = msg; }
 
+// Live activity log: appends one timestamped line per fetch event so the user
+// can see exactly what's happening (each query, retries with their countdown,
+// give-ups) instead of a single frozen status line. Capped to the most recent
+// lines and auto-scrolled to the newest.
+const LOG_MAX_LINES = 80;
+function clearFetchLog() {
+  const box = $("fetchlog");
+  box.innerHTML = "";
+  box.classList.add("hidden");
+}
+function logFetch(msg, level) {
+  const box = $("fetchlog");
+  box.classList.remove("hidden");
+  const line = document.createElement("div");
+  if (level && level !== "info") line.className = level;
+  const t = new Date().toTimeString().slice(0, 8);
+  line.textContent = `${t}  ${msg}`;
+  box.appendChild(line);
+  while (box.childElementCount > LOG_MAX_LINES) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+// Determinate progress bar for the multi-query fetch phase. Splits settled
+// queries into a green (succeeded) and red (failed) segment; the unfilled
+// remainder of the track represents still-pending queries.
+function setProgress(done, total, failed) {
+  $("progress").classList.remove("hidden");
+  const pct = (n) => (total ? Math.round((n / total) * 100) : 0) + "%";
+  $("progressGood").style.width = pct(done - failed);
+  $("progressBad").style.width = pct(failed);
+}
+function hideProgress() {
+  $("progress").classList.add("hidden");
+  $("progressGood").style.width = "0";
+  $("progressBad").style.width = "0";
+}
+
 async function fetchJSON(url) {
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) {
@@ -420,36 +471,116 @@ async function fetchAbi(addr) {
   } catch (_) { return null; }
 }
 
-// Fetch one topic's logs via the RPC getLogs endpoint with retry/backoff.
+/* Retry / backoff tuning. We issue one getLogs query per event topic (≈18 in
+ * total); firing them all at once is what trips BlockScout's rate limiter, so we
+ * cap concurrency and back off exponentially (with jitter) on failure. */
+const MAX_ATTEMPTS = 5;        // initial try + 4 retries per query
+const BASE_DELAY = 500;        // ms; doubles each retry (0.5s, 1s, 2s, 4s)
+const MAX_BACKOFF = 8000;      // ms; ceiling for a single wait
+const FETCH_CONCURRENCY = 4;   // max simultaneous in-flight queries
+
+// Exponential backoff with full jitter: base*2^attempt, randomised to avoid a
+// thundering herd of retries all landing at once. Capped at MAX_BACKOFF.
+function backoffDelay(attempt) {
+  const exp = Math.min(BASE_DELAY * 2 ** attempt, MAX_BACKOFF);
+  return Math.round(exp / 2 + Math.random() * (exp / 2));
+}
+
+// Honour a server-supplied Retry-After header (seconds, or an HTTP-date),
+// clamped so a hostile/garbage value can't stall us indefinitely.
+function parseRetryAfter(header) {
+  if (!header) return null;
+  const secs = Number(header);
+  if (Number.isFinite(secs)) return Math.max(0, Math.min(secs * 1000, MAX_BACKOFF));
+  const when = Date.parse(header);
+  if (!Number.isNaN(when)) return Math.max(0, Math.min(when - Date.now(), MAX_BACKOFF));
+  return null;
+}
+
+// Run `worker` over `items` with at most `limit` in flight at once, preserving
+// input order in the returned results array.
+async function runPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const lane = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+  return results;
+}
+
+// Fetch one topic's logs via the RPC getLogs endpoint with exponential backoff.
 // Distinguishes a genuine empty result ("No logs found") from a transient error,
 // since some instances intermittently return {status:"0", result:null}.
-async function fetchLogsForTopic(addr, topic0) {
+// `onRetry({attempt, max, reason, waitMs})` fires before each backoff wait.
+async function fetchLogsForTopic(addr, topic0, onRetry) {
   const url = `${BASE}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${addr}&topic0=${topic0}`;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let reason = "network error";
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let retryAfter = null;
     try {
       const res = await fetch(url, { headers: { accept: "application/json" } });
       if (res.ok) {
         const j = await res.json();
         if (Array.isArray(j.result)) return { items: j.result, truncated: j.result.length >= 1000, failed: false };
         if (/no logs? found/i.test(j.message || "")) return { items: [], truncated: false, failed: false };
+        reason = j.message ? `API: ${j.message}` : "unexpected response";
+      } else {
+        reason = res.status === 429 ? "rate-limited (429)" : `HTTP ${res.status}`;
+        if (res.status === 429 || res.status === 503) retryAfter = parseRetryAfter(res.headers.get("retry-after"));
       }
-    } catch (_) { /* network error → retry */ }
-    if (attempt < 3) await sleep(400 * (attempt + 1));
+    } catch (_) { reason = "network error"; }
+    if (attempt < MAX_ATTEMPTS - 1) {
+      const waitMs = retryAfter != null ? retryAfter : backoffDelay(attempt);
+      if (onRetry) onRetry({ attempt: attempt + 1, max: MAX_ATTEMPTS, reason, waitMs });
+      await sleep(waitMs);
+    }
   }
-  return { items: [], truncated: false, failed: true };
+  return { items: [], truncated: false, failed: true, reason };
 }
 
-// Fetch all role-related logs (classic + AccessManager) in parallel.
-async function fetchRoleLogs(addr) {
+// Human-readable name for a single getLogs query (its event signature), used in
+// the live fetch log, e.g. "Safe AddedOwner" or "AccessControl RoleGranted".
+function topicQueryName(t0) {
+  const m = TOPIC_MAP[t0] || {};
+  const sys = /^Ownership/.test(m.kind || "") ? "Ownable"
+    : m.system === "am" ? "AccessManager"
+    : m.system === "safe" ? "Safe" : "AccessControl";
+  return `${sys} ${m.kind || "event"}`;
+}
+
+// Fetch all role-related logs (classic + AccessManager + Safe), capped to
+// FETCH_CONCURRENCY simultaneous queries. `onProgress({done,total,failedCount,
+// message})` is called as queries settle/retry, with `message` describing the
+// latest event (a fetch, a retry-with-countdown, or a give-up) so the caller
+// can show the user exactly what's happening rather than a frozen line.
+async function fetchRoleLogs(addr, onProgress) {
+  const total = ALL_TOPICS.length;
+  let done = 0, failedCount = 0;
+  const report = (message, level) => onProgress && onProgress({ done, total, failedCount, message, level });
+
+  const results = await runPool(ALL_TOPICS, FETCH_CONCURRENCY, async (t0) => {
+    const name = topicQueryName(t0);
+    const r = await fetchLogsForTopic(addr, t0, ({ attempt, max, reason, waitMs }) => {
+      report(`${name} failed (${reason}); retrying in ${(waitMs / 1000).toFixed(1)}s [retry ${attempt}/${max - 1}]…`, "warn");
+    });
+    done++;
+    if (r.failed) { failedCount++; report(`${name} gave up after ${MAX_ATTEMPTS} attempts (${r.reason}).`, "bad"); }
+    else report(`Fetched ${name} — ${r.items.length} log${r.items.length === 1 ? "" : "s"}.`, "info");
+    return r;
+  });
+
   const logs = [];
   let truncated = false, failed = false;
-  const results = await Promise.all(ALL_TOPICS.map((t0) => fetchLogsForTopic(addr, t0)));
   for (const r of results) {
     if (r.failed) { failed = true; continue; }
     if (r.truncated) truncated = true;
     for (const it of r.items) logs.push(it);
   }
-  return { logs, truncated, failed };
+  return { logs, truncated, failed, failedCount, total };
 }
 
 // Read-only eth_call via the same BlockScout instance's JSON-RPC endpoint
@@ -1030,7 +1161,7 @@ function renderAuditLog(events, map, am) {
 }
 
 function render(ctx) {
-  const { addr, addrDisplay, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed } = ctx;
+  const { addr, addrDisplay, chainName, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed, failedCount, topicTotal } = ctx;
   const { classic, am, safe } = state;
   const out = [];
 
@@ -1061,7 +1192,8 @@ function render(ctx) {
   </div>`);
 
   if (failed) {
-    out.push(`<div class="banner bad">⚠ One or more event queries failed after retries (the BlockScout instance may be rate-limiting or unstable). Results below may be incomplete – try again shortly.</div>`);
+    const detail = failedCount && topicTotal ? `${failedCount} of ${topicTotal} event queries` : "One or more event queries";
+    out.push(`<div class="banner bad">⚠ ${detail} failed after ${MAX_ATTEMPTS} attempts (the BlockScout instance may be rate-limiting or unstable). Results below may be incomplete – try again shortly.</div>`);
   }
   if (truncated) {
     out.push(`<div class="banner warn">⚠ One or more event queries hit BlockScout's 1000-log limit; holder lists may be incomplete for this very high-volume contract.</div>`);
@@ -1217,47 +1349,66 @@ async function analyse() {
   });
 
   $("go").disabled = true;
+  clearFetchLog();
   try {
     setStatus("Fetching contract metadata…");
+    logFetch(`Fetching contract metadata for ${addr}…`);
     const info = await fetchAddressInfo(addr);
+    logFetch(info ? "Contract metadata received." : "No metadata available (continuing).", info ? "info" : "warn");
 
     // Proxy / implementation resolution
     const isProxy = !!(info && (info.proxy_type || (info.implementations && info.implementations.length)));
     const implAddr = info && info.implementations && info.implementations.length
       ? info.implementations[0].address_hash : null;
+    if (isProxy) logFetch(`Proxy detected — implementation ${implAddr || "unknown"}.`);
 
-    setStatus("Fetching ABI…");
+    setStatus("Fetching contract ABI…");
+    logFetch("Fetching contract ABI…");
     let abi = [];
     let abiAvailable = false;
     const own = await fetchAbi(addr);
     if (own) { abi = abi.concat(own.abi); if (own.abi.length) abiAvailable = true; }
+    logFetch(abiAvailable ? `ABI received (${abi.length} entries).` : "ABI unavailable / unverified.", abiAvailable ? "info" : "warn");
 
     // For proxies, pull the implementation ABI (or its verified twin) for role constants.
     const implCandidates = [implAddr, own && own.twin].filter((a) => a && isAddress(a) && lc(a) !== lc(addr));
     for (const cand of implCandidates) {
       try {
+        setStatus("Fetching implementation ABI…");
+        logFetch(`Fetching implementation ABI (${cand})…`);
         const implAbi = await fetchAbi(cand);
-        if (implAbi && implAbi.abi.length) { abi = abi.concat(implAbi.abi); abiAvailable = true; break; }
+        if (implAbi && implAbi.abi.length) { abi = abi.concat(implAbi.abi); abiAvailable = true; logFetch(`Implementation ABI received (${implAbi.abi.length} entries).`); break; }
       } catch (_) { /* ignore */ }
     }
 
     const abiRoleNames = [...new Set(extractRoleNames(abi))];
     const map = buildRoleNameMap(abiRoleNames, customNames);
 
-    setStatus("Scanning role events since deployment…");
-    const { logs, truncated, failed } = await fetchRoleLogs(addr);
+    setStatus(`Scanning role events since deployment… 0/${ALL_TOPICS.length} queries`);
+    logFetch(`Scanning ${ALL_TOPICS.length} event types since deployment (max ${FETCH_CONCURRENCY} at a time)…`);
+    setProgress(0, ALL_TOPICS.length, 0);
+    const { logs, truncated, failed, failedCount, total } = await fetchRoleLogs(addr, (p) => {
+      let msg = `Scanning role events… ${p.done}/${p.total} queries complete`;
+      if (p.failedCount) msg += ` · ${p.failedCount} failed`;
+      setStatus(msg);
+      setProgress(p.done, p.total, p.failedCount);
+      if (p.message) logFetch(p.message, p.level);
+    });
 
     setStatus(`Replaying ${logs.length} event${logs.length === 1 ? "" : "s"}…`);
+    logFetch(`All queries settled — replaying ${logs.length} event${logs.length === 1 ? "" : "s"}.`);
     const state = replay(logs);
     state.am.overrides = amOverrides;
 
-    render({ addr: lc(addr), addrDisplay: addr, chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed });
+    render({ addr: lc(addr), addrDisplay: addr, chainName: chain.name, info, abiRoleNames, abiAvailable, isProxy, implAddr, map, state, truncated, failed, failedCount, topicTotal: total });
     const roleCount = state.classic.rolesSeen.size + state.am.rolesSeen.size;
-    setStatus(`Done – ${roleCount} role${roleCount === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.`);
+    const partial = failed ? ` ⚠ ${failedCount}/${total} queries failed – results may be incomplete.` : "";
+    setStatus(`Done – ${roleCount} role${roleCount === 1 ? "" : "s"} seen, ${logs.length} event${logs.length === 1 ? "" : "s"} processed.${partial}`);
   } catch (e) {
     $("results").innerHTML = `<div class="banner bad">Error: ${esc(e.message || String(e))}. The BlockScout instance may be rate-limiting or unreachable – try again shortly.</div>`;
     setStatus("");
   } finally {
+    hideProgress();
     $("go").disabled = false;
   }
 }
